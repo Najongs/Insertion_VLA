@@ -19,9 +19,6 @@ from torch.utils.data import random_split
 
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
-from qwen_vl_utils import process_vision_info
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -37,10 +34,26 @@ torch.backends.cudnn.benchmark = False
 torch.use_deterministic_algorithms(True, warn_only=True)
 torch.set_float32_matmul_precision("high")
 
-from model import QwenActionExpert, Not_freeze_QwenVLAForAction
+from model_with_sensor import Not_freeze_QwenVLAWithSensor
 from Total_Dataset import collate_fn, infer_lang_from_path
 from Total_Dataset import BridgeRawSequenceDataset, insertionMeca500Dataset
 from Make_VL_cache import build_vl_cache_distributed_optimized
+
+
+def is_dist_active() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist_active() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist_active() else 1
+
+
+def unwrap_model(model):
+    return getattr(model, "module", model)
 
 # ======== I/O & Checkpoint Utils ========
 STAGING_DIR = Path("/dev/shm/qwen_vla_stage")   # 로컬 RAM/NVMe (없으면 /tmp 권장)
@@ -219,13 +232,17 @@ def Train(
     sched_on="step",
     val_loader=None,
     start_epoch=0,           # ✅ 추가
+    *,
+    enable_wandb: bool = True,
 ):
     loss_fn = nn.MSELoss()
-    rank = dist.get_rank()
+    rank = get_rank()
+    dist_active = is_dist_active()
     writer = AsyncCheckpointWriter(max_queue=2, sync_every=0) if rank == 0 else None
 
     model.train()
-    if rank == 0:
+    module_ref = unwrap_model(model)
+    if rank == 0 and enable_wandb:
         wandb.init(
             project="QwenVLA",
             name=f"train_run_{time.strftime('%m%d_%H%M')}",
@@ -237,6 +254,8 @@ def Train(
                 "grad_accum_steps": grad_accum_steps,
                 "epochs": num_epochs,
                 "scheduler": sched_on,
+                "batch_size": data_loader.batch_size,
+                "cache_mode": getattr(module_ref, "cache_mode", getattr(module_ref, "cache_enabled", None)),
             }
         )
 
@@ -263,11 +282,12 @@ def Train(
                     text_inputs=instructions,
                     image_inputs=image_inputs,
                     z_chunk=gt_actions,
+                    sensor_data=batch.get("sensor_data"),
                     cache_keys=batch["cache_keys"],
                 )
 
-                weights = torch.tensor(batch["confidence"], device=device, dtype=torch.bfloat16)
-                weights = weights / weights.mean()
+                weights = torch.as_tensor(batch["confidence"], device=device, dtype=torch.bfloat16)
+                weights = weights / (weights.mean() + 1e-6)
                 loss_each = (pred_actions.float() - gt_actions.float()).pow(2).mean(dim=[1,2])
                 loss = (loss_each * weights).mean() / grad_accum_steps
 
@@ -292,16 +312,18 @@ def Train(
                         "lr": f"{lr:.2e}",
                         "grad": f"{grad_norm:.2f}"
                     })
-                    wandb.log({
-                        "train/loss_step": loss.item() * grad_accum_steps,
-                        "train/lr": lr,
-                        "train/grad_norm": grad_norm,
-                        "global_step": global_step
-                    })
+                    if enable_wandb:
+                        wandb.log({
+                            "train/loss_step": loss.item() * grad_accum_steps,
+                            "train/lr": lr,
+                            "train/grad_norm": grad_norm,
+                            "global_step": global_step
+                        })
 
         # === epoch 평균 ===
         avg_loss_tensor = torch.tensor(total_loss / len(data_loader), device=device)
-        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
+        if dist_active:
+            dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
         avg_loss = avg_loss_tensor.item()
 
         # === scheduler per epoch ===
@@ -320,19 +342,29 @@ def Train(
                         text_inputs=batch["instruction"],
                         image_inputs=batch["images"],
                         z_chunk=gt_actions,
+                        sensor_data=batch.get("sensor_data"),
                         cache_keys=batch["cache_keys"],
                     )
-                    weights = torch.tensor(batch["confidence"], device=device, dtype=torch.bfloat16)
-                    weights = weights / weights.mean()  # 평균 1로 정규화
+                    weights = torch.as_tensor(batch["confidence"], device=device, dtype=torch.bfloat16)
+                    weights = weights / (weights.mean() + 1e-6)  # 평균 1로 정규화
                     loss_each = (pred_actions.float() - gt_actions.float()).pow(2).mean(dim=[1,2])  # 샘플별 MSE
                     loss = (loss_each * weights).mean() / grad_accum_steps
                     val_loss_sum += loss.item()
                     val_count += 1
-            val_loss = val_loss_sum / max(1, val_count)
+            if dist_active:
+                loss_tensor = torch.tensor(val_loss_sum, device=device)
+                count_tensor = torch.tensor(val_count, device=device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+                total_count = max(1, int(count_tensor.item()))
+                val_loss = (loss_tensor / total_count).item()
+            else:
+                total_count = max(1, val_count)
+                val_loss = val_loss_sum / total_count
             model.train()
 
 
-    
+
         # === epoch 종료 후 ===
         if rank == 0:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -345,32 +377,36 @@ def Train(
             gc.collect()
 
             # === 추가 로깅 ===
-            wandb.log({
-                "epoch": epoch + 1,
-                "train/loss_epoch": avg_loss,
-                "val/loss_epoch": val_loss if val_loss else None,
-                "params/trainable_M": trainable / 1e6,
-                "params/frozen_M": frozen / 1e6,
-                "params/frozen_ratio": frozen / total_params,
-                "system/gpu_mem_GB": gpu_mem,
-                "system/cpu_mem_%": cpu_mem,
-                "lr/base_lr": optimizer.param_groups[0]["lr"],
-                "lr/vl_lr": optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else None,
-                "lr/vision_lr": optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else None,
-                "scheduler/phase_ratio_warmup": scheduler._get_lr_lambda(0) if hasattr(scheduler, "_get_lr_lambda") else None,
-            })
+            if enable_wandb:
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "train/loss_epoch": avg_loss,
+                    "val/loss_epoch": val_loss if val_loss is not None else None,
+                    "params/trainable_M": trainable / 1e6,
+                    "params/frozen_M": frozen / 1e6,
+                    "params/frozen_ratio": frozen / total_params,
+                    "system/gpu_mem_GB": gpu_mem,
+                    "system/cpu_mem_%": cpu_mem,
+                    "lr/base_lr": optimizer.param_groups[0]["lr"],
+                    "lr/vl_lr": optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else None,
+                    "lr/vision_lr": optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else None,
+                    "scheduler/phase_ratio_warmup": scheduler._get_lr_lambda(0) if hasattr(scheduler, "_get_lr_lambda") else None,
+                })
 
             print(f"[DEBUG] GPU {gpu_mem:.2f} GB / CPU {cpu_mem:.1f}% used "
                   f"| Trainable {trainable/1e6:.2f}M / Frozen {frozen/1e6:.2f}M")
 
             # === LoRA 파라미터 로깅 (선택) ===
-            lora_params = {n: p for n, p in model.named_parameters() if "lora_" in n}
+            lora_params = {n: p for n, p in module_ref.named_parameters() if "lora_" in n}
             if lora_params:
                 avg_abs = np.mean([p.data.abs().mean().item() for p in lora_params.values()])
-                wandb.log({"lora/avg_weight_abs": avg_abs})
+                if enable_wandb:
+                    wandb.log({"lora/avg_weight_abs": avg_abs})
 
-            print(f"\n📊 Epoch {epoch+1} Summary | Train: {avg_loss:.8f} | "
-                  f"Val: {val_loss:.8f}" if val_loss else f"\n📊 Epoch {epoch+1} Train Loss: {avg_loss:.8f}")
+            if val_loss is not None:
+                print(f"\n📊 Epoch {epoch+1} Summary | Train: {avg_loss:.8f} | Val: {val_loss:.8f}")
+            else:
+                print(f"\n📊 Epoch {epoch+1} Train Loss: {avg_loss:.8f}")
 
             save_dir = Path(save_path).parent
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -387,7 +423,7 @@ def Train(
                 best_path = save_dir / "qwen_vla_best.pt"
                 torch.save({
                     "epoch": epoch,
-                    "model_state_dict": model.module.state_dict(),
+                    "model_state_dict": module_ref.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
                     "val_loss": val_loss,
@@ -399,7 +435,7 @@ def Train(
                 tmp_path = base_path.with_suffix(".tmp")
                 torch.save({
                     "epoch": epoch,
-                    "model_state_dict": model.module.state_dict(),
+                    "model_state_dict": module_ref.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
                     "val_loss": val_loss,
@@ -410,7 +446,7 @@ def Train(
     if rank == 0 and writer is not None:
         writer.close()
 
-    if rank == 0:
+    if rank == 0 and enable_wandb:
         wandb.finish()
 
 def main():
@@ -424,6 +460,13 @@ def main():
     parser.add_argument("--hold-ratio", type=float, default=0.02)
     parser.add_argument("--grad-accum-steps", type=int, default=8)
     parser.add_argument("--sched-on", choices=["step", "epoch"], default="step")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--val-ratio", type=float, default=0.05)
+    parser.add_argument("--cache-batch-size", type=int, default=4)
+    parser.add_argument("--cache-max-gb", type=float, default=20.0)
+    parser.add_argument("--cache-mode", choices=["auto", "strict", "off"], default="auto")
+    parser.add_argument("--cache-dir", type=str, default="/home/najo/NAS/VLA/dataset/cache/qwen_vl_features")
 
     # ===== 추가된 LoRA / Fine-tuning 옵션 =====
     parser.add_argument("--finetune-vl", choices=["none", "lora", "full"], default="lora",
@@ -487,39 +530,35 @@ def main():
         if rank == 0:
             print("⏳ Initializing VL-only model for cache building...")
 
-        processor = AutoProcessor.from_pretrained(vl_model_name)
-        vl_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            vl_model_name,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map="cuda",
-            low_cpu_mem_usage=True,          # ← 로딩 속도/메모리 최적화
-        )
+        cache_model = Not_freeze_QwenVLAWithSensor(
+            vl_model_name=vl_model_name,
+            action_dim=7,
+            horizon=8,
+            hidden_dim=1024,
+            finetune_vl="none",
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            unfreeze_last_n=args.unfreeze_last_n,
+            sensor_enabled=False,
+            fusion_strategy="none",
+            cache_dir=args.cache_dir,
+        ).to(device)
 
-        class DummyVLA:
-            def __init__(self, vl_model, processor):
-                self.vl_model = vl_model
-                self.processor = processor
-                self.cache_dir = Path("/home/najo/NAS/VLA/dataset/cache/qwen_vl_features")
-                self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-                # ✅ 인스턴스 메서드만 바인딩
-                self._cache_path = Not_freeze_QwenVLAForAction._cache_path.__get__(self)
-                self._enforce_cache_limit = Not_freeze_QwenVLAForAction._enforce_cache_limit.__get__(self)
-
-                # ✅ staticmethod는 그대로 복사
-                self._atomic_save = Not_freeze_QwenVLAForAction._atomic_save
-
-            def eval(self):
-                self.vl_model.eval()
-                return self
-
-        dummy_model = DummyVLA(vl_model, processor)
+        cache_model.set_cache(True)
+        cache_model.set_cache_limit(args.cache_max_gb)
+        cache_model.set_strict_cache(False)
+        cache_model.eval()
 
         # 캐시 빌드
         build_vl_cache_distributed_optimized(
-            dummy_model, dataset, device=device,
-            rank_sharded_cache=False
+            cache_model,
+            dataset,
+            device=device,
+            batch_size=args.cache_batch_size,
+            num_workers=args.num_workers,
+            rank_sharded_cache=False,
+            max_cache_gb=args.cache_max_gb,
         )
         
         dist.barrier()
@@ -535,7 +574,7 @@ def main():
         if rank == 0:
             print("⏳ Initializing full QwenVLA model for training...")
 
-        model = Not_freeze_QwenVLAForAction(
+        model = Not_freeze_QwenVLAWithSensor(
             vl_model_name=vl_model_name,
             action_dim=7,
             horizon=8,
@@ -544,41 +583,63 @@ def main():
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            unfreeze_last_n=args.unfreeze_last_n
+            unfreeze_last_n=args.unfreeze_last_n,
+            sensor_enabled=False,
+            fusion_strategy="none",
+            cache_dir=args.cache_dir,
         ).to(device)
         
         # 전체 데이터셋 분할
         total_len = len(dataset)
-        val_len = int(total_len * 0.05)   # 5% validation
+        val_len = max(1, int(total_len * args.val_ratio)) if total_len > 1 else 0
         train_len = total_len - val_len
         train_ds, val_ds = random_split(dataset, [train_len, val_len])
 
         # DDP용 Sampler
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
-        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
+        val_sampler = None
+        if len(val_ds) > 0:
+            val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
 
         # 각각에 대한 DataLoader
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=1,
-            num_workers=4,
-            sampler=train_sampler,
+        loader_kwargs = dict(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
             collate_fn=collate_fn,
-            prefetch_factor=4,
-            persistent_workers=False,
-            pin_memory=False
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=1,
-            num_workers=4,
-            sampler=val_sampler,
-            collate_fn=collate_fn,
-            persistent_workers=False,
             pin_memory=False,
         )
+        if args.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(2, args.batch_size)
+            loader_kwargs["persistent_workers"] = True
+
+        train_loader = DataLoader(
+            train_ds,
+            sampler=train_sampler,
+            **loader_kwargs,
+        )
+        val_loader = None
+        if len(val_ds) > 0:
+            val_loader = DataLoader(
+                val_ds,
+                sampler=val_sampler,
+                **loader_kwargs,
+            )
 
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        module_ref = unwrap_model(model)
+
+        module_ref.set_cache_limit(args.cache_max_gb)
+        if args.cache_mode == "strict":
+            module_ref.set_cache(True)
+            module_ref.set_strict_cache(True)
+        elif args.cache_mode == "off":
+            module_ref.set_cache(False)
+            module_ref.set_strict_cache(False)
+        else:
+            module_ref.set_strict_cache(False)
+
+        if rank == 0:
+            print(f"🗄️ Cache mode set to {args.cache_mode} (limit {args.cache_max_gb}GB)")
         
         # === Optimizer 구성 ===
         def wd_filter(name, param):
@@ -586,8 +647,8 @@ def main():
             if name.endswith(".bias"): return False
             return True
 
-        ae_named = list(model.module.action_expert.named_parameters())
-        vl_named = list(model.module.vl_model.named_parameters())
+        ae_named = list(module_ref.action_expert.named_parameters())
+        vl_named = list(module_ref.vl_model.named_parameters())
 
         ae_decay    = [p for n,p in ae_named if wd_filter(n,p) and p.requires_grad]
         ae_n_decay  = [p for n,p in ae_named if not wd_filter(n,p) and p.requires_grad]
@@ -634,11 +695,12 @@ def main():
                 print(f"🔄 Found checkpoint at {ckpt_path}, resuming training...")
             checkpoint = copy_to_local_then_load(Path(ckpt_path), map_location=device)
 
+            module_ref = unwrap_model(model)
             try:
-                model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                module_ref.load_state_dict(checkpoint["model_state_dict"], strict=False)
                 print("✅ Loaded model weights (partial, strict=False)")
             except KeyError:
-                model.module.load_state_dict(checkpoint, strict=False)
+                module_ref.load_state_dict(checkpoint, strict=False)
 
 
             if "optimizer_state_dict" in checkpoint:
@@ -724,9 +786,10 @@ def main():
         # ✅ 최종 체크포인트 저장 (모든 상태 포함)
         if rank == 0:
             final_path = Path("./checkpoints/qwen_vla_final.pt")
+            module_ref = unwrap_model(model)
             torch.save({
                 "epoch": total_epochs - 1,
-                "model_state_dict": model.module.state_dict(),
+                "model_state_dict": module_ref.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
             }, final_path)

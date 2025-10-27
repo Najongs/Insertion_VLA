@@ -311,6 +311,10 @@ class QwenVLAWithSensor(nn.Module):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_enabled = True
+        self.cache_limit_gb = 20.0
+        self.strict_cache = False
+        self.action_dim = action_dim
+        self.horizon = horizon
 
         # 🔹 VL Model (Frozen)
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
@@ -390,6 +394,15 @@ class QwenVLAWithSensor(nn.Module):
     def set_cache(self, enabled: bool = True):
         self.cache_enabled = enabled
 
+    def set_strict_cache(self, enabled: bool = True):
+        self.strict_cache = enabled
+
+    def set_cache_limit(self, limit_gb: float):
+        try:
+            self.cache_limit_gb = float(limit_gb)
+        except (TypeError, ValueError):
+            raise ValueError("limit_gb must be convertible to float") from None
+
     def _cache_path(self, key: str, txt: str, views: list[str | None]) -> Path:
         vlist = [v for v in views if v is not None]
         raw = key + "||" + txt + "||" + "|".join(vlist)
@@ -409,15 +422,32 @@ class QwenVLAWithSensor(nn.Module):
             finally:
                 fcntl.flock(lockfile, fcntl.LOCK_UN)
 
-    def _enforce_cache_limit(self, max_gb=20):
+    def _enforce_cache_limit(self):
+        limit_gb = getattr(self, "cache_limit_gb", 20.0)
         total_bytes = sum(f.stat().st_size for f in self.cache_dir.glob("*.pt"))
-        if total_bytes > max_gb * (1024 ** 3):
+        if total_bytes > limit_gb * (1024 ** 3):
             all_files = sorted(self.cache_dir.glob("*.pt"), key=lambda f: f.stat().st_mtime)
-            while total_bytes > max_gb * (1024 ** 3) and all_files:
+            while total_bytes > limit_gb * (1024 ** 3) and all_files:
                 f = all_files.pop(0)
                 total_bytes -= f.stat().st_size
                 f.unlink(missing_ok=True)
-            print(f"⚠️ Cache limit exceeded. Trimmed to {max_gb}GB.")
+            print(f"⚠️ Cache limit exceeded. Trimmed to {limit_gb}GB.")
+
+    def encode_vision(self, text_inputs, image_inputs, cache_keys, cache: bool = True):
+        device = next(self.vl_model.parameters()).device
+        horizon = getattr(self, "horizon", 8)
+        action_dim = getattr(self, "action_dim", 7)
+        dtype = getattr(self, "model_dtype", torch.bfloat16)
+        dummy = torch.zeros(len(text_inputs), horizon, action_dim, device=device, dtype=dtype)
+        with torch.inference_mode():
+            self(
+                text_inputs=text_inputs,
+                image_inputs=image_inputs,
+                z_chunk=dummy,
+                sensor_data=None,
+                cache_keys=cache_keys,
+                cache=cache,
+            )
 
     def forward(self,
                 text_inputs,
@@ -469,6 +499,10 @@ class QwenVLAWithSensor(nn.Module):
             vision_inputs, video_inputs = process_vision_info(messages)
             return key, txt, views, text, vision_inputs, video_inputs
 
+        if miss_items and use_cache and getattr(self, "strict_cache", False):
+            missing_keys = [key for _, _, key in miss_items]
+            raise FileNotFoundError(f"Missing cached features for keys: {missing_keys}")
+
         if miss_items:
             with ThreadPoolExecutor(max_workers=24) as executor:
                 results = list(executor.map(preprocess_message, miss_items))
@@ -498,7 +532,7 @@ class QwenVLAWithSensor(nn.Module):
                     if use_cache:
                         cache_path = self._cache_path(key, txt, views)
                         self._atomic_save(pooled.detach().to("cpu", dtype=torch.float16), cache_path)
-                        self._enforce_cache_limit(max_gb=20)
+                        self._enforce_cache_limit()
 
                     pooled_vl_tokens_dict[key] = pooled.to(dtype=torch.bfloat16)
 
@@ -560,6 +594,10 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
         self.finetune_vl = finetune_vl
         self.sensor_enabled = sensor_enabled
         self.cache_mode = "on"
+        self.cache_limit_gb = 20.0
+        self.strict_cache = False
+        self.action_dim = action_dim
+        self.horizon = horizon
 
         # 🔹 VL Model
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
@@ -605,6 +643,18 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
             self.cache_mode = "off"
         else:
             self.cache_mode = "on"
+
+    def set_cache(self, enabled: bool = True):
+        self.cache_mode = "on" if enabled else "off"
+
+    def set_strict_cache(self, enabled: bool = True):
+        self.strict_cache = enabled
+
+    def set_cache_limit(self, limit_gb: float):
+        try:
+            self.cache_limit_gb = float(limit_gb)
+        except (TypeError, ValueError):
+            raise ValueError("limit_gb must be convertible to float") from None
 
     def _load_qwen_with_fallback(self, vl_model_name):
         """Load Qwen-VL with attention implementation fallback"""
@@ -690,15 +740,16 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                 os.replace(tmp, path)
             fcntl.flock(lockfile, fcntl.LOCK_UN)
 
-    def _enforce_cache_limit(self, max_gb=20):
+    def _enforce_cache_limit(self):
+        limit_gb = getattr(self, "cache_limit_gb", 20.0)
         total_bytes = sum(f.stat().st_size for f in self.cache_dir.glob("*.pt"))
-        if total_bytes > max_gb * (1024 ** 3):
+        if total_bytes > limit_gb * (1024 ** 3):
             all_files = sorted(self.cache_dir.glob("*.pt"), key=lambda f: f.stat().st_mtime)
-            while total_bytes > max_gb * (1024 ** 3) and all_files:
+            while total_bytes > limit_gb * (1024 ** 3) and all_files:
                 f = all_files.pop(0)
                 total_bytes -= f.stat().st_size
                 f.unlink(missing_ok=True)
-            print(f"⚠️ Cache trimmed to {max_gb}GB.")
+            print(f"⚠️ Cache trimmed to {limit_gb}GB.")
 
     def _encode_lazy_cache(self, text_inputs, image_inputs, cache_keys, device):
         pooled_vl_tokens_dict = {}
@@ -711,6 +762,10 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                 pooled_vl_tokens_dict[key] = pooled.to(device, dtype=torch.bfloat16)
             else:
                 miss_items.append((txt, views, key))
+
+        if miss_items and getattr(self, "strict_cache", False):
+            missing_keys = [key for _, _, key in miss_items]
+            raise FileNotFoundError(f"Missing cached features for keys: {missing_keys}")
 
         if miss_items:
             def preprocess(args):
@@ -731,19 +786,47 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                     inputs = self.processor(
                         text=[text], images=vision_inputs,
                         padding=True, return_tensors="pt"
-                    ).to(device=device, dtype=torch.bfloat16)
+                    )
+
+                    vl_device = next(self.vl_model.parameters()).device
+                    inputs = inputs.to(device=vl_device, dtype=torch.bfloat16)
 
                     outputs = self.vl_model(**inputs, output_hidden_states=True, return_dict=True)
                     vl_tokens = outputs.hidden_states[-1]
                     pooled = vl_tokens.mean(dim=1, keepdim=True)
 
                     self._atomic_save(pooled.detach().to("cpu", dtype=torch.float16), path)
-                    self._enforce_cache_limit(max_gb=20)
-                    pooled_vl_tokens_dict[key] = pooled
+                    self._enforce_cache_limit()
+                    pooled_vl_tokens_dict[key] = pooled.to(device=device, dtype=torch.bfloat16)
 
         ordered = [pooled_vl_tokens_dict[k] for k in cache_keys if k in pooled_vl_tokens_dict]
         vl_tokens = torch.cat(ordered, dim=0)
         return vl_tokens
+
+    def encode_vision(self, text_inputs, image_inputs, cache_keys, cache: bool = True):
+        if not cache:
+            prev_mode = self.cache_mode
+            self.cache_mode = "off"
+        else:
+            prev_mode = self.cache_mode
+            self.cache_mode = "on"
+
+        device = next(self.parameters()).device
+        horizon = getattr(self, "horizon", 8)
+        action_dim = getattr(self, "action_dim", 7)
+        dtype = getattr(self, "model_dtype", torch.bfloat16)
+        dummy = torch.zeros(len(text_inputs), horizon, action_dim, device=device, dtype=dtype)
+        try:
+            with torch.inference_mode():
+                self(
+                    text_inputs=text_inputs,
+                    image_inputs=image_inputs,
+                    z_chunk=dummy,
+                    sensor_data=None,
+                    cache_keys=cache_keys,
+                )
+        finally:
+            self.cache_mode = prev_mode
 
     def forward(self,
                 text_inputs,
