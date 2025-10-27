@@ -773,19 +773,26 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                 msg_content = [{"type": "image", "image": v} for v in views if v is not None]
                 msg_content.append({"type": "text", "text": txt})
                 messages = [{"role": "user", "content": msg_content}]
-                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                vision_inputs, _ = process_vision_info(messages)
-                return key, txt, views, text, vision_inputs
+                text = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+                vision_inputs, video_inputs = process_vision_info(messages)
+                return key, txt, views, text, vision_inputs, video_inputs
 
             with ThreadPoolExecutor(max_workers=4) as ex:
                 results = list(ex.map(preprocess, miss_items))
 
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                for key, txt, views, text, vision_inputs in results:
+                for key, txt, views, text, vision_inputs, video_inputs in results:
                     path = self._cache_path(key, txt, views)
                     inputs = self.processor(
-                        text=[text], images=vision_inputs,
-                        padding=True, return_tensors="pt"
+                        text=[text],
+                        images=vision_inputs,
+                        videos=video_inputs,
+                        padding=True,
+                        return_tensors="pt",
                     )
 
                     vl_device = next(self.vl_model.parameters()).device
