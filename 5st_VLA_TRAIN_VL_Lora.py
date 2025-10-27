@@ -39,6 +39,22 @@ from Total_Dataset import collate_fn, infer_lang_from_path
 from Total_Dataset import BridgeRawSequenceDataset, insertionMeca500Dataset
 from Make_VL_cache import build_vl_cache_distributed_optimized
 
+
+def is_dist_active() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist_active() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist_active() else 1
+
+
+def unwrap_model(model):
+    return getattr(model, "module", model)
+
 # ======== I/O & Checkpoint Utils ========
 STAGING_DIR = Path("/dev/shm/qwen_vla_stage")   # 로컬 RAM/NVMe (없으면 /tmp 권장)
 CKPT_DIR     = Path("./checkpoints")            # NAS 또는 공유 디렉토리
@@ -216,14 +232,17 @@ def Train(
     sched_on="step",
     val_loader=None,
     start_epoch=0,           # ✅ 추가
+    *,
+    enable_wandb: bool = True,
 ):
     loss_fn = nn.MSELoss()
-    rank = dist.get_rank()
+    rank = get_rank()
+    dist_active = is_dist_active()
     writer = AsyncCheckpointWriter(max_queue=2, sync_every=0) if rank == 0 else None
 
     model.train()
-    module_ref = getattr(model, "module", model)
-    if rank == 0:
+    module_ref = unwrap_model(model)
+    if rank == 0 and enable_wandb:
         wandb.init(
             project="QwenVLA",
             name=f"train_run_{time.strftime('%m%d_%H%M')}",
@@ -293,16 +312,18 @@ def Train(
                         "lr": f"{lr:.2e}",
                         "grad": f"{grad_norm:.2f}"
                     })
-                    wandb.log({
-                        "train/loss_step": loss.item() * grad_accum_steps,
-                        "train/lr": lr,
-                        "train/grad_norm": grad_norm,
-                        "global_step": global_step
-                    })
+                    if enable_wandb:
+                        wandb.log({
+                            "train/loss_step": loss.item() * grad_accum_steps,
+                            "train/lr": lr,
+                            "train/grad_norm": grad_norm,
+                            "global_step": global_step
+                        })
 
         # === epoch 평균 ===
         avg_loss_tensor = torch.tensor(total_loss / len(data_loader), device=device)
-        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
+        if dist_active:
+            dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
         avg_loss = avg_loss_tensor.item()
 
         # === scheduler per epoch ===
@@ -330,16 +351,20 @@ def Train(
                     loss = (loss_each * weights).mean() / grad_accum_steps
                     val_loss_sum += loss.item()
                     val_count += 1
-            loss_tensor = torch.tensor(val_loss_sum, device=device)
-            count_tensor = torch.tensor(val_count, device=device)
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
-            total_count = max(1, int(count_tensor.item()))
-            val_loss = (loss_tensor / total_count).item()
+            if dist_active:
+                loss_tensor = torch.tensor(val_loss_sum, device=device)
+                count_tensor = torch.tensor(val_count, device=device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+                total_count = max(1, int(count_tensor.item()))
+                val_loss = (loss_tensor / total_count).item()
+            else:
+                total_count = max(1, val_count)
+                val_loss = val_loss_sum / total_count
             model.train()
 
 
-    
+
         # === epoch 종료 후 ===
         if rank == 0:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -352,29 +377,31 @@ def Train(
             gc.collect()
 
             # === 추가 로깅 ===
-            wandb.log({
-                "epoch": epoch + 1,
-                "train/loss_epoch": avg_loss,
-                "val/loss_epoch": val_loss if val_loss is not None else None,
-                "params/trainable_M": trainable / 1e6,
-                "params/frozen_M": frozen / 1e6,
-                "params/frozen_ratio": frozen / total_params,
-                "system/gpu_mem_GB": gpu_mem,
-                "system/cpu_mem_%": cpu_mem,
-                "lr/base_lr": optimizer.param_groups[0]["lr"],
-                "lr/vl_lr": optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else None,
-                "lr/vision_lr": optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else None,
-                "scheduler/phase_ratio_warmup": scheduler._get_lr_lambda(0) if hasattr(scheduler, "_get_lr_lambda") else None,
-            })
+            if enable_wandb:
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "train/loss_epoch": avg_loss,
+                    "val/loss_epoch": val_loss if val_loss is not None else None,
+                    "params/trainable_M": trainable / 1e6,
+                    "params/frozen_M": frozen / 1e6,
+                    "params/frozen_ratio": frozen / total_params,
+                    "system/gpu_mem_GB": gpu_mem,
+                    "system/cpu_mem_%": cpu_mem,
+                    "lr/base_lr": optimizer.param_groups[0]["lr"],
+                    "lr/vl_lr": optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else None,
+                    "lr/vision_lr": optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else None,
+                    "scheduler/phase_ratio_warmup": scheduler._get_lr_lambda(0) if hasattr(scheduler, "_get_lr_lambda") else None,
+                })
 
             print(f"[DEBUG] GPU {gpu_mem:.2f} GB / CPU {cpu_mem:.1f}% used "
                   f"| Trainable {trainable/1e6:.2f}M / Frozen {frozen/1e6:.2f}M")
 
             # === LoRA 파라미터 로깅 (선택) ===
-            lora_params = {n: p for n, p in model.named_parameters() if "lora_" in n}
+            lora_params = {n: p for n, p in module_ref.named_parameters() if "lora_" in n}
             if lora_params:
                 avg_abs = np.mean([p.data.abs().mean().item() for p in lora_params.values()])
-                wandb.log({"lora/avg_weight_abs": avg_abs})
+                if enable_wandb:
+                    wandb.log({"lora/avg_weight_abs": avg_abs})
 
             if val_loss is not None:
                 print(f"\n📊 Epoch {epoch+1} Summary | Train: {avg_loss:.8f} | Val: {val_loss:.8f}")
@@ -396,7 +423,7 @@ def Train(
                 best_path = save_dir / "qwen_vla_best.pt"
                 torch.save({
                     "epoch": epoch,
-                    "model_state_dict": model.module.state_dict(),
+                    "model_state_dict": module_ref.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
                     "val_loss": val_loss,
@@ -408,7 +435,7 @@ def Train(
                 tmp_path = base_path.with_suffix(".tmp")
                 torch.save({
                     "epoch": epoch,
-                    "model_state_dict": model.module.state_dict(),
+                    "model_state_dict": module_ref.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
                     "val_loss": val_loss,
@@ -419,7 +446,7 @@ def Train(
     if rank == 0 and writer is not None:
         writer.close()
 
-    if rank == 0:
+    if rank == 0 and enable_wandb:
         wandb.finish()
 
 def main():
@@ -599,16 +626,17 @@ def main():
             )
 
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        module_ref = unwrap_model(model)
 
-        model.module.set_cache_limit(args.cache_max_gb)
+        module_ref.set_cache_limit(args.cache_max_gb)
         if args.cache_mode == "strict":
-            model.module.set_cache(True)
-            model.module.set_strict_cache(True)
+            module_ref.set_cache(True)
+            module_ref.set_strict_cache(True)
         elif args.cache_mode == "off":
-            model.module.set_cache(False)
-            model.module.set_strict_cache(False)
+            module_ref.set_cache(False)
+            module_ref.set_strict_cache(False)
         else:
-            model.module.set_strict_cache(False)
+            module_ref.set_strict_cache(False)
 
         if rank == 0:
             print(f"🗄️ Cache mode set to {args.cache_mode} (limit {args.cache_max_gb}GB)")
@@ -619,8 +647,8 @@ def main():
             if name.endswith(".bias"): return False
             return True
 
-        ae_named = list(model.module.action_expert.named_parameters())
-        vl_named = list(model.module.vl_model.named_parameters())
+        ae_named = list(module_ref.action_expert.named_parameters())
+        vl_named = list(module_ref.vl_model.named_parameters())
 
         ae_decay    = [p for n,p in ae_named if wd_filter(n,p) and p.requires_grad]
         ae_n_decay  = [p for n,p in ae_named if not wd_filter(n,p) and p.requires_grad]
@@ -667,11 +695,12 @@ def main():
                 print(f"🔄 Found checkpoint at {ckpt_path}, resuming training...")
             checkpoint = copy_to_local_then_load(Path(ckpt_path), map_location=device)
 
+            module_ref = unwrap_model(model)
             try:
-                model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                module_ref.load_state_dict(checkpoint["model_state_dict"], strict=False)
                 print("✅ Loaded model weights (partial, strict=False)")
             except KeyError:
-                model.module.load_state_dict(checkpoint, strict=False)
+                module_ref.load_state_dict(checkpoint, strict=False)
 
 
             if "optimizer_state_dict" in checkpoint:
@@ -757,9 +786,10 @@ def main():
         # ✅ 최종 체크포인트 저장 (모든 상태 포함)
         if rank == 0:
             final_path = Path("./checkpoints/qwen_vla_final.pt")
+            module_ref = unwrap_model(model)
             torch.save({
                 "epoch": total_epochs - 1,
-                "model_state_dict": model.module.state_dict(),
+                "model_state_dict": module_ref.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
             }, final_path)
