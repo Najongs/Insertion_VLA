@@ -796,8 +796,8 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                     pooled = vl_tokens.mean(dim=1, keepdim=True)
 
                     self._atomic_save(pooled.detach().to("cpu", dtype=torch.float16), path)
-                    self._enforce_cache_limit()
-                    pooled_vl_tokens_dict[key] = pooled.to(device=device, dtype=torch.bfloat16)
+                    self._enforce_cache_limit(max_gb=20)
+                    pooled_vl_tokens_dict[key] = pooled
 
         ordered = [pooled_vl_tokens_dict[k] for k in cache_keys if k in pooled_vl_tokens_dict]
         vl_tokens = torch.cat(ordered, dim=0)
