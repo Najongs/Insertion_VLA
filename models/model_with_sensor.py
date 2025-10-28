@@ -53,12 +53,16 @@ class SensorEncoder(nn.Module):
                  use_transformer=True,
                  num_transformer_layers=2,
                  nhead=8,
-                 dropout=0.1):
+                 dropout=0.1,
+                 gradient_checkpointing=False,
+                 interpolation_mode='linear'):
         super().__init__()
 
         self.input_channels = input_channels
         self.temporal_length = temporal_length
         self.output_dim = output_dim
+        self.gradient_checkpointing = gradient_checkpointing
+        self.interpolation_mode = interpolation_mode  # 'linear', 'nearest', or 'cubic'
 
         # 🔹 1D Convolutional backbone for temporal feature extraction
         conv_layers = []
@@ -115,24 +119,52 @@ class SensorEncoder(nn.Module):
     def forward(self, sensor_data: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            sensor_data: (B, T, C) where T=650, C=1026
+            sensor_data: (B, T, C) where T can be variable, C=1026
         Returns:
             sensor_features: (B, output_dim)
+
+        Note: Supports variable-length inputs through automatic interpolation
         """
         B, T, C = sensor_data.shape
-        assert T == self.temporal_length and C == self.input_channels, \
-            f"Expected input shape (B, {self.temporal_length}, {self.input_channels}), got {sensor_data.shape}"
+
+        # Validate channel dimension
+        if C != self.input_channels:
+            raise ValueError(f"Expected {self.input_channels} channels, got {C}")
+
+        # Handle variable temporal length with automatic interpolation
+        if T != self.temporal_length:
+            # Interpolate to target length using configurable interpolation mode
+            # (B, T, C) → (B, C, T) → interpolate → (B, C, T_target) → (B, T_target, C)
+            x = sensor_data.transpose(1, 2)  # (B, C, T)
+
+            # Select interpolation mode based on configuration
+            if self.interpolation_mode == 'cubic':
+                # Cubic interpolation requires at least 4 points
+                if T >= 4:
+                    x = F.interpolate(x, size=self.temporal_length, mode='cubic', align_corners=False)
+                else:
+                    x = F.interpolate(x, size=self.temporal_length, mode='linear', align_corners=False)
+            else:
+                x = F.interpolate(x, size=self.temporal_length, mode=self.interpolation_mode, align_corners=False if self.interpolation_mode == 'linear' else None)
+
+            sensor_data = x.transpose(1, 2)  # (B, T_target, C)
 
         # (B, T, C) → (B, C, T) for Conv1d
         x = sensor_data.transpose(1, 2)
 
-        # 1D Convolutional feature extraction
-        x = self.conv_backbone(x)  # (B, hidden_dim*2, T')
+        # 1D Convolutional feature extraction with optional gradient checkpointing
+        if self.gradient_checkpointing and self.training:
+            x = torch.utils.checkpoint.checkpoint(self.conv_backbone, x, use_reentrant=False)
+        else:
+            x = self.conv_backbone(x)  # (B, hidden_dim*2, T')
 
         # Optional Transformer for temporal modeling
         if self.use_transformer:
             x = x.transpose(1, 2)  # (B, T', hidden_dim*2)
-            x = self.transformer(x)  # (B, T', hidden_dim*2)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(self.transformer, x, use_reentrant=False)
+            else:
+                x = self.transformer(x)  # (B, T', hidden_dim*2)
             x = x.transpose(1, 2)  # (B, hidden_dim*2, T')
 
         # Temporal pooling

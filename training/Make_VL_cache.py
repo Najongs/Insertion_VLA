@@ -1,5 +1,5 @@
-
 import os
+import sys
 import math
 
 from pathlib import Path
@@ -12,6 +12,10 @@ import torch.distributed as dist
 
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import DataLoader, DistributedSampler
+
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from vla_datasets.Total_Dataset import collate_fn
 

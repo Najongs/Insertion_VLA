@@ -12,6 +12,7 @@ import argparse
 import wandb
 import io, shutil, threading, queue, time
 import os
+import sys
 import re
 import math
 import glob
@@ -20,6 +21,10 @@ import numpy as np
 import torch
 from pathlib import Path
 from tqdm import tqdm
+
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn as nn
@@ -48,9 +53,16 @@ torch.use_deterministic_algorithms(True, warn_only=True)
 torch.set_float32_matmul_precision("high")
 
 # ✅ NEW: Import sensor-enabled model and dataset
-from model_with_sensor import Not_freeze_QwenVLAWithSensor
-from IntegratedDataset import collate_fn_with_sensor, create_integrated_dataloader
-from Make_VL_cache import build_vl_cache_distributed_optimized
+from models.model_with_sensor import Not_freeze_QwenVLAWithSensor
+from vla_datasets.IntegratedDataset import collate_fn_with_sensor, create_integrated_dataloader
+
+# Import cache builder (from same directory)
+import importlib.util
+cache_module_path = Path(__file__).parent / "Make_VL_cache.py"
+spec = importlib.util.spec_from_file_location("Make_VL_cache", cache_module_path)
+cache_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cache_module)
+build_vl_cache_distributed_optimized = cache_module.build_vl_cache_distributed_optimized
 
 # ======== I/O & Checkpoint Utils ========
 STAGING_DIR = Path("/dev/shm/qwen_vla_stage")   # 로컬 RAM/NVMe (없으면 /tmp 권장)
@@ -558,21 +570,21 @@ def main():
     if rank == 0:
         print("📦 Building integrated dataset...")
 
-    from IntegratedDataset import insertionMeca500DatasetWithSensor
+    from vla_datasets.IntegratedDataset import insertionMeca500DatasetWithSensor
     import glob
 
     datasets = []
 
     # With sensor data
     sensor_dataset_dirs = [
-        "/home/najo/NAS/VLA/Insertion_VLA/dataset/White_silicone_white_circle/recv_all_*",
-        "/home/najo/NAS/VLA/Insertion_VLA/dataset/Needle_insertion_eye_trocar/recv_all_*",
+        "/home/najo/NAS/VLA/dataset/White_silicone_white_circle/recv_all_*",
+        "/home/najo/NAS/VLA/dataset/Needle_insertion_eye_trocar/recv_all_*",
     ]
 
     # Without sensor data
     nosensor_dataset_dirs = [
-        "/home/najo/NAS/VLA/Insertion_VLA/dataset/OCT_insertion/Captures*",
-        "/home/najo/NAS/VLA/Insertion_VLA/dataset/part1/ZED_Captures_*th",
+        "/home/najo/NAS/VLA/dataset/OCT_insertion/Captures*",
+        "/home/najo/NAS/VLA/dataset/part1/ZED_Captures_*th",
     ]
 
     # Expand wildcards and load datasets

@@ -1,0 +1,22 @@
+{
+  "profiling_results": {
+    "mean_ms": 880.3242844063789,
+    "std_ms": 1.5250683081134322,
+    "min_ms": 876.3940460048616,
+    "max_ms": 882.2852037847042,
+    "median_ms": 880.6314743123949,
+    "p95_ms": 882.1118350373581,
+    "p99_ms": 882.268366641365,
+    "mean_hz": 1.1359450349303053,
+    "p95_hz": 1.1336431054205833,
+    "p99_hz": 1.1334419750385225,
+    "gpu_memory_gb": 11.128174592
+  },
+  "recommendations": {
+    "vlm_update_hz": 1.0,
+    "vlm_update_period_ms": 1000.0,
+    "vlm_reuse_count": 10,
+    "action_expert_hz": 10.0,
+    "sensor_window_samples": 65
+  }
+}

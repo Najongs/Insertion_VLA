@@ -710,6 +710,11 @@ class Not_freeze_QwenVLAWithSensorDiffusion(nn.Module):
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
         self.vl_model = self._load_qwen_with_fallback(vl_model_name)
 
+        # Enable gradient checkpointing to save memory
+        if hasattr(self.vl_model, 'gradient_checkpointing_enable'):
+            self.vl_model.gradient_checkpointing_enable()
+            print("✅ Gradient checkpointing enabled for VL model")
+
         # Sensor Encoder (Trainable)
         if sensor_enabled:
             self.sensor_encoder = SensorEncoder(
@@ -746,16 +751,24 @@ class Not_freeze_QwenVLAWithSensorDiffusion(nn.Module):
         if finetune_vl == "lora":
             print("💡 Applying LoRA fine-tuning to VL model...")
             self._inject_lora_to_vl(lora_r, lora_alpha, lora_dropout)
+            # Must use cache_mode="off" to actually train LoRA
             self.cache_mode = "off"
+            print("   ⚠️  Cache OFF: Computing VL forward pass every iteration (required for LoRA training)")
+            print("   💡 Tip: Use small batch_size (1-2) + gradient_accumulation for memory efficiency")
         elif finetune_vl == "full":
             print(f"💡 Unfreezing last {unfreeze_last_n} layers...")
             self._selective_unfreeze_vl(unfreeze_last_n)
             self.cache_mode = "off"
+            print("   ⚠️  Cache OFF: Computing VL forward pass every iteration")
         else:
-            print("🧊 Using frozen VL backbone.")
+            print("🧊 Using frozen VL backbone with cache enabled.")
 
     def _load_qwen_with_fallback(self, vl_model_name):
-        """Load Qwen-VL with attention implementation fallback"""
+        """Load Qwen-VL with attention implementation fallback
+
+        Note: Do not use device_map="auto" when using DDP!
+        DDP requires each process to have the full model on its own device.
+        """
         dtype_candidates = [torch.bfloat16, torch.float16]
         attn_candidates = ["flash_attention_2", "sdpa"]
 
@@ -767,7 +780,6 @@ class Not_freeze_QwenVLAWithSensorDiffusion(nn.Module):
                         vl_model_name,
                         torch_dtype=dtype,
                         attn_implementation=impl,
-                        device_map="auto",
                         low_cpu_mem_usage=True,
                     )
                     print(f"✅ Successfully loaded with {impl} ({dtype})")
@@ -783,7 +795,6 @@ class Not_freeze_QwenVLAWithSensorDiffusion(nn.Module):
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     vl_model_name,
                     torch_dtype=dtype,
-                    device_map="auto",
                     low_cpu_mem_usage=True,
                 )
                 print(f"✅ Successfully loaded with default attention ({dtype})")
@@ -964,27 +975,33 @@ class Not_freeze_QwenVLAWithSensorDiffusion(nn.Module):
 
         # Process VL features
         if self.cache_mode == "off":
-            msg_batch = []
+            # Process each sample individually to avoid OOM
+            pooled_vl_tokens_list = []
+
             for txt, views in zip(text_inputs, image_inputs):
                 msg_content = [{"type": "image", "image": v} for v in views if v is not None]
                 msg_content.append({"type": "text", "text": txt})
-                msg_batch.append({"role": "user", "content": msg_content})
+                msg_batch = [{"role": "user", "content": msg_content}]
 
-            text = self.processor.apply_chat_template(msg_batch, tokenize=False, add_generation_prompt=False)
-            vision_inputs, video_inputs = process_vision_info(msg_batch)
+                text = self.processor.apply_chat_template(msg_batch, tokenize=False, add_generation_prompt=False)
+                vision_inputs, video_inputs = process_vision_info(msg_batch)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                inputs = self.processor(
-                    text=[text],
-                    images=vision_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt"
-                ).to(device=device, dtype=torch.bfloat16)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    inputs = self.processor(
+                        text=[text],
+                        images=vision_inputs,
+                        videos=video_inputs,
+                        padding=True,
+                        return_tensors="pt"
+                    ).to(device=device, dtype=torch.bfloat16)
 
-                outputs = self.vl_model(**inputs, output_hidden_states=True, return_dict=True)
-                vl_tokens = outputs.hidden_states[-1]
-                pooled_vl_tokens = vl_tokens.mean(dim=1, keepdim=True)
+                    outputs = self.vl_model(**inputs, output_hidden_states=True, return_dict=True)
+                    vl_tokens = outputs.hidden_states[-1]  # (1, seq_len, hidden_dim)
+                    pooled = vl_tokens.mean(dim=1)  # (1, hidden_dim)
+                    pooled_vl_tokens_list.append(pooled)
+
+            # Concatenate all samples
+            pooled_vl_tokens = torch.cat(pooled_vl_tokens_list, dim=0).unsqueeze(1)  # (B, 1, hidden_dim)
         else:
             pooled_vl_tokens = self._encode_lazy_cache(text_inputs, image_inputs, cache_keys, device)
 

@@ -19,6 +19,7 @@ import argparse
 import wandb
 import io, shutil, threading, queue, time
 import os
+import sys
 import re
 import math
 import glob
@@ -27,6 +28,10 @@ import numpy as np
 import torch
 from pathlib import Path
 from tqdm import tqdm
+
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn as nn
@@ -55,9 +60,16 @@ torch.use_deterministic_algorithms(True, warn_only=True)
 torch.set_float32_matmul_precision("high")
 
 # Import diffusion model and dataset
-from model_with_sensor_diffusion import QwenVLAWithSensorDiffusion, Not_freeze_QwenVLAWithSensorDiffusion
-from IntegratedDataset import collate_fn_with_sensor, create_integrated_dataloader
-from Make_VL_cache import build_vl_cache_distributed_optimized
+from models.model_with_sensor_diffusion import QwenVLAWithSensorDiffusion, Not_freeze_QwenVLAWithSensorDiffusion
+from vla_datasets.IntegratedDataset import collate_fn_with_sensor, create_integrated_dataloader
+
+# Import cache builder (from same directory)
+import importlib.util
+cache_module_path = Path(__file__).parent / "Make_VL_cache.py"
+spec = importlib.util.spec_from_file_location("Make_VL_cache", cache_module_path)
+cache_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cache_module)
+build_vl_cache_distributed_optimized = cache_module.build_vl_cache_distributed_optimized
 
 # ======== I/O & Checkpoint Utils ========
 STAGING_DIR = Path("/dev/shm/qwen_vla_stage")
@@ -360,7 +372,11 @@ def Train_Diffusion(
 
 def validate_diffusion(model, val_loader, device, sensor_enabled, sensor_loss_weight):
     """Validation for diffusion model"""
-    model.eval()
+    # Keep model in train mode for forward pass (but use no_grad)
+    # This is needed because the model checks self.training to decide whether to return training outputs
+    was_training = model.training
+    model.train()
+
     loss_fn = nn.MSELoss(reduction='none')
     total_loss = 0.0
 
@@ -393,7 +409,12 @@ def validate_diffusion(model, val_loader, device, sensor_enabled, sensor_loss_we
                 loss = (loss_per_sample * weights).mean()
                 total_loss += loss.item()
 
-    model.train()
+    # Restore original training state
+    if was_training:
+        model.train()
+    else:
+        model.eval()
+
     return total_loss / len(val_loader)
 
 # ===========================================================
@@ -445,19 +466,8 @@ def main():
             print(f"   Stage 1 Checkpoint: {args.stage1_checkpoint}")
             print(f"   VL Fine-tuning: {args.finetune_vl}")
 
-    # Build VL cache first
-    if rank == 0:
-        print("Building VL cache...")
-        build_vl_cache_distributed_optimized(
-            dataset_root=Path(args.dataset_dir),
-            cache_dir=Path("/home/najo/NAS/VLA/dataset/cache/qwen_vl_features"),
-            world_size=1,
-            rank=0,
-            batch_size=1,
-        )
-        print("VL cache built!")
-
-    dist.barrier()
+    # Note: VL cache will be built on-the-fly during training
+    # For faster training, you can pre-build cache using Make_VL_cache.py
 
     # Load model based on training stage
     if args.training_stage == 'stage1':
@@ -491,9 +501,27 @@ def main():
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
             stage1_checkpoint=args.stage1_checkpoint,
-        ).to(device)
+        )
 
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        # Move entire model to device (including VL model with LoRA)
+        model = model.to(device)
+
+        # Explicitly move VL model to ensure PEFT wrapped model is on correct device
+        if hasattr(model, 'vl_model'):
+            model.vl_model = model.vl_model.to(device)
+
+        if rank == 0:
+            print(f"✅ Model moved to device: {device}")
+
+    # DDP with find_unused_parameters for Stage 2 (when using cache with LoRA)
+    find_unused = (args.training_stage == 'stage2' and args.finetune_vl != 'none')
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                find_unused_parameters=find_unused,
+                gradient_as_bucket_view=False)  # Required for gradient checkpointing
+
+    # Set static graph for gradient checkpointing compatibility
+    if args.training_stage == 'stage2':
+        model._set_static_graph()
 
     # Create dataloader
     train_loader, val_loader = create_integrated_dataloader(
@@ -507,13 +535,39 @@ def main():
         world_size=world_size,
     )
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=0.01,
-        betas=(0.9, 0.95),
-    )
+    # Optimizer - Different learning rates for VL and other components in Stage 2
+    if args.training_stage == 'stage2' and args.finetune_vl != 'none':
+        # Separate parameter groups for VL (LoRA) and others
+        vl_params = []
+        other_params = []
+
+        model_module = model.module if hasattr(model, 'module') else model
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                # LoRA parameters or VL model parameters
+                if 'vl_model' in name or 'lora' in name.lower():
+                    vl_params.append(param)
+                else:
+                    other_params.append(param)
+
+        if rank == 0:
+            print(f"🎯 Optimizer config:")
+            print(f"   VL params: {len(vl_params)} (lr={args.vl_lr})")
+            print(f"   Other params: {len(other_params)} (lr={args.lr})")
+
+        optimizer = torch.optim.AdamW([
+            {'params': vl_params, 'lr': args.vl_lr, 'weight_decay': 0.01},
+            {'params': other_params, 'lr': args.lr, 'weight_decay': 0.01},
+        ], betas=(0.9, 0.95))
+    else:
+        # Stage 1: Single learning rate
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr,
+            weight_decay=0.01,
+            betas=(0.9, 0.95),
+        )
 
     # Scheduler
     total_steps = len(train_loader) * args.epochs // args.grad_accum

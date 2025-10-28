@@ -9,9 +9,14 @@ Usage:
 """
 
 import argparse
+import sys
 import torch
 import numpy as np
 from pathlib import Path
+
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 # Color codes for terminal output
 GREEN = '\033[92m'
@@ -33,7 +38,7 @@ def test_imports():
     """Test 1: Check if imports work"""
     print(f"\n{BLUE}Test 1: Checking imports...{RESET}")
     try:
-        from model_with_sensor import (
+        from models.model_with_sensor import (
             SensorEncoder,
             QwenActionExpertWithSensor,
             QwenVLAWithSensor,
@@ -50,7 +55,7 @@ def test_sensor_encoder(device='cpu'):
     """Test 2: Sensor Encoder forward pass"""
     print(f"\n{BLUE}Test 2: Testing Sensor Encoder...{RESET}")
     try:
-        from model_with_sensor import SensorEncoder
+        from models.model_with_sensor import SensorEncoder
 
         encoder = SensorEncoder(
             input_channels=1026,
@@ -94,7 +99,7 @@ def test_action_expert(device='cpu'):
 
     for strategy in ['concat', 'cross_attention', 'gated', 'none']:
         try:
-            from model_with_sensor import QwenActionExpertWithSensor
+            from models.model_with_sensor import QwenActionExpertWithSensor
 
             action_expert = QwenActionExpertWithSensor(
                 vl_dim=512,
@@ -144,7 +149,7 @@ def test_full_model_frozen(device='cpu', quick=False):
         return True
 
     try:
-        from model_with_sensor import QwenVLAWithSensor
+        from models.model_with_sensor import QwenVLAWithSensor
 
         # Note: This will try to load Qwen2.5-VL-3B model
         # Set sensor_enabled=False for faster testing
@@ -191,7 +196,7 @@ def test_parameter_counts():
     print(f"\n{BLUE}Test 5: Testing Parameter Counts...{RESET}")
 
     try:
-        from model_with_sensor import SensorEncoder, QwenActionExpertWithSensor
+        from models.model_with_sensor import SensorEncoder, QwenActionExpertWithSensor
 
         # Sensor encoder
         encoder = SensorEncoder(
@@ -249,7 +254,7 @@ def test_backward_compatibility():
 
     try:
         # Test that we can import original model classes
-        from model_with_sensor import (
+        from models.model_with_sensor import (
             QwenActionExpert_Original,
             QwenVLAForAction_Original,
             Not_freeze_QwenVLAForAction_Original

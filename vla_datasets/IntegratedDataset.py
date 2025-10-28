@@ -67,7 +67,8 @@ def extract_sensor_window(timestamps: np.ndarray,
                          window_size: int = 650,
                          sample_rate: float = 650.0,
                          start_time: float = None,
-                         end_time: float = None) -> np.ndarray:
+                         end_time: float = None,
+                         adaptive_window: bool = False) -> np.ndarray:
     """
     Extract sensor data window based on time interval or single timestamp
 
@@ -80,9 +81,11 @@ def extract_sensor_window(timestamps: np.ndarray,
         sample_rate: Sensor sampling rate in Hz
         start_time: Start of interval (new - preferred method)
         end_time: End of interval (new - preferred method)
+        adaptive_window: If True, return actual samples without padding/truncation
+                        (useful with variable-length SensorEncoder)
 
     Returns:
-        sensor_window: (window_size, 1026) array of [force, aline]
+        sensor_window: (window_size, 1026) or (actual_size, 1026) array of [force, aline]
     """
     if timestamps is None or len(timestamps) == 0:
         # Return zeros if no sensor data
@@ -115,7 +118,13 @@ def extract_sensor_window(timestamps: np.ndarray,
         aline_window            # (N, 1025)
     ], axis=1)
 
-    # Pad or truncate to window_size
+    # Handle adaptive window mode
+    if adaptive_window:
+        # Return actual data without padding/truncation
+        # The model will handle variable-length inputs
+        return sensor_data.astype(np.float32)
+
+    # Pad or truncate to window_size (default behavior)
     actual_size = len(sensor_data)
 
     if actual_size < window_size:
@@ -155,12 +164,14 @@ class CSVBasedDatasetWithSensor(Dataset):
                  horizon: int = 8,
                  instruction: str = "Approach the white square silicone",
                  sensor_window_size: int = 650,
-                 view_selection: list = None):
+                 view_selection: list = None,
+                 cache_sensor_windows: bool = True):
 
         self.trajectory_dir = Path(trajectory_dir)
         self.horizon = horizon
         self.instruction = instruction
         self.sensor_window_size = sensor_window_size
+        self.cache_sensor_windows = cache_sensor_windows
 
         # Default view selection
         if view_selection is None:
@@ -238,6 +249,13 @@ class CSVBasedDatasetWithSensor(Dataset):
         self.samples = self._index_chunks()
         print(f"   ✅ Indexed {len(self.samples)} chunks (horizon={horizon}, has_sensor={self.has_sensor})")
 
+        # Pre-compute and cache sensor windows if enabled
+        self.sensor_window_cache = {}
+        if self.has_sensor and self.cache_sensor_windows:
+            print(f"   🔄 Pre-computing sensor windows for faster loading...")
+            self._precompute_sensor_windows_csv()
+            print(f"   ✅ Cached {len(self.sensor_window_cache)} sensor windows")
+
     def _detect_available_views(self) -> list:
         """Detect available camera views"""
         views = []
@@ -288,6 +306,23 @@ class CSVBasedDatasetWithSensor(Dataset):
         # Only keep chunks that have images
         valid_chunks = [i for i in range(chunk_count) if i in self.image_index]
         return valid_chunks
+
+    def _precompute_sensor_windows_csv(self):
+        """Pre-compute and cache all sensor windows for CSV-based dataset"""
+        if not self.has_sensor:
+            return
+
+        for t in tqdm(range(len(self.timestamps) - 1), desc="Caching sensor windows"):
+            target_timestamp = self.timestamps[t]
+            sensor_window = extract_sensor_window(
+                self.sensor_timestamps,
+                self.sensor_forces,
+                self.sensor_alines,
+                target_timestamp,
+                window_size=self.sensor_window_size
+            )
+            # Store as torch tensor for faster loading
+            self.sensor_window_cache[t] = torch.tensor(sensor_window, dtype=torch.float32)
 
     def __len__(self):
         return len(self.samples)
@@ -341,15 +376,20 @@ class CSVBasedDatasetWithSensor(Dataset):
         # === Sensor data loading ===
         sensor_data = None
         if self.has_sensor:
-            target_timestamp = self.timestamps[t]
-            sensor_window = extract_sensor_window(
-                self.sensor_timestamps,
-                self.sensor_forces,
-                self.sensor_alines,
-                target_timestamp,
-                window_size=self.sensor_window_size
-            )
-            sensor_data = torch.tensor(sensor_window, dtype=torch.float32)
+            # Use cached sensor window if available
+            if self.cache_sensor_windows and t in self.sensor_window_cache:
+                sensor_data = self.sensor_window_cache[t]
+            else:
+                # Compute on-the-fly if not cached
+                target_timestamp = self.timestamps[t]
+                sensor_window = extract_sensor_window(
+                    self.sensor_timestamps,
+                    self.sensor_forces,
+                    self.sensor_alines,
+                    target_timestamp,
+                    window_size=self.sensor_window_size
+                )
+                sensor_data = torch.tensor(sensor_window, dtype=torch.float32)
 
         # === Language & metadata ===
         lang = self.instruction
@@ -396,12 +436,14 @@ class insertionMeca500DatasetWithSensor(Dataset):
                  horizon: int = 8,
                  instruction: str = "Approach the white square silicone",
                  sensor_window_size: int = 650,
-                 view_selection: list = None):
+                 view_selection: list = None,
+                 cache_sensor_windows: bool = True):
 
         self.trajectory_dir = Path(trajectory_dir)
         self.horizon = horizon
         self.instruction = instruction
         self.sensor_window_size = sensor_window_size
+        self.cache_sensor_windows = cache_sensor_windows
 
         # Default view selection: View1_left and View5_oak
         if view_selection is None:
@@ -468,6 +510,13 @@ class insertionMeca500DatasetWithSensor(Dataset):
         self.samples = self._index_chunks()
         print(f"   ✅ Indexed {len(self.samples)} chunks (horizon={horizon}, has_sensor={self.has_sensor})")
 
+        # Pre-compute and cache sensor windows if enabled
+        self.sensor_window_cache = {}
+        if self.has_sensor and self.cache_sensor_windows:
+            print(f"   🔄 Pre-computing sensor windows for faster loading...")
+            self._precompute_sensor_windows()
+            print(f"   ✅ Cached {len(self.sensor_window_cache)} sensor windows")
+
     def _detect_available_views(self) -> list:
         """Detect which camera views are available"""
         views = []
@@ -505,6 +554,43 @@ class insertionMeca500DatasetWithSensor(Dataset):
         num_actions = len(self.actions)
         chunk_count = max(num_actions - self.horizon + 1, 0)
         return list(range(chunk_count))
+
+    def _precompute_sensor_windows(self):
+        """Pre-compute and cache all sensor windows for faster data loading"""
+        if not self.has_sensor:
+            return
+
+        for idx in tqdm(range(len(self.trajectory_data)), desc="Caching sensor windows"):
+            current_data_point = self.trajectory_data[idx]
+
+            # Check if sensor_interval info is available (new format)
+            if 'sensor_interval' in current_data_point:
+                interval_info = current_data_point['sensor_interval']
+                sensor_window = extract_sensor_window(
+                    self.sensor_timestamps,
+                    self.sensor_forces,
+                    self.sensor_alines,
+                    start_time=interval_info['start'],
+                    end_time=interval_info['end'],
+                    window_size=self.sensor_window_size
+                )
+            else:
+                # Fallback to old method (single timestamp)
+                target_timestamp = current_data_point.get('timestamp', 0.0)
+                if target_timestamp > 0:
+                    sensor_window = extract_sensor_window(
+                        self.sensor_timestamps,
+                        self.sensor_forces,
+                        self.sensor_alines,
+                        target_timestamp=target_timestamp,
+                        window_size=self.sensor_window_size
+                    )
+                else:
+                    sensor_window = None
+
+            if sensor_window is not None:
+                # Store as torch tensor for faster loading
+                self.sensor_window_cache[idx] = torch.tensor(sensor_window, dtype=torch.float32)
 
     def __len__(self):
         return len(self.samples)
@@ -567,33 +653,38 @@ class insertionMeca500DatasetWithSensor(Dataset):
         # === Sensor data loading (OPTIONAL) ===
         sensor_data = None
         if self.has_sensor:
-            # Check if sensor_interval info is available (new format)
-            if 'sensor_interval' in current_data_point:
-                interval_info = current_data_point['sensor_interval']
-                sensor_window = extract_sensor_window(
-                    self.sensor_timestamps,
-                    self.sensor_forces,
-                    self.sensor_alines,
-                    start_time=interval_info['start'],
-                    end_time=interval_info['end'],
-                    window_size=self.sensor_window_size
-                )
+            # Use cached sensor window if available
+            if self.cache_sensor_windows and t in self.sensor_window_cache:
+                sensor_data = self.sensor_window_cache[t]
             else:
-                # Fallback to old method (single timestamp)
-                target_timestamp = current_data_point.get('timestamp', 0.0)
-                if target_timestamp > 0:
+                # Compute on-the-fly if not cached
+                # Check if sensor_interval info is available (new format)
+                if 'sensor_interval' in current_data_point:
+                    interval_info = current_data_point['sensor_interval']
                     sensor_window = extract_sensor_window(
                         self.sensor_timestamps,
                         self.sensor_forces,
                         self.sensor_alines,
-                        target_timestamp=target_timestamp,
+                        start_time=interval_info['start'],
+                        end_time=interval_info['end'],
                         window_size=self.sensor_window_size
                     )
                 else:
-                    sensor_window = None
+                    # Fallback to old method (single timestamp)
+                    target_timestamp = current_data_point.get('timestamp', 0.0)
+                    if target_timestamp > 0:
+                        sensor_window = extract_sensor_window(
+                            self.sensor_timestamps,
+                            self.sensor_forces,
+                            self.sensor_alines,
+                            target_timestamp=target_timestamp,
+                            window_size=self.sensor_window_size
+                        )
+                    else:
+                        sensor_window = None
 
-            if sensor_window is not None:
-                sensor_data = torch.tensor(sensor_window, dtype=torch.float32)
+                if sensor_window is not None:
+                    sensor_data = torch.tensor(sensor_window, dtype=torch.float32)
 
         # sensor_data can be None if no sensor data available
 
@@ -802,32 +893,79 @@ def collate_fn_with_sensor(batch):
 # Helper Functions
 # =====================================
 def create_integrated_dataloader(
+    dataset_root: str = None,
     trajectory_dirs: list = None,
     bridge_root: str = None,
     batch_size: int = 4,
     horizon: int = 8,
     shuffle: bool = True,
     num_workers: int = 4,
-    bridge_max_traj: int = None
+    bridge_max_traj: int = None,
+    val_split: float = 0.1,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ):
     """
-    Create a DataLoader with integrated datasets
+    Create train and validation DataLoaders with integrated datasets
 
     Args:
-        trajectory_dirs: List of paths to custom trajectory directories
+        dataset_root: Path to root directory containing trajectory subdirectories
+        trajectory_dirs: List of specific paths to custom trajectory directories (overrides dataset_root)
         bridge_root: Path to Bridge dataset root (optional)
-        batch_size: Batch size
+        batch_size: Batch size per GPU
         horizon: Action horizon
-        shuffle: Whether to shuffle
+        shuffle: Whether to shuffle training data
         num_workers: Number of worker processes
         bridge_max_traj: Maximum number of Bridge trajectories to use
+        val_split: Validation split ratio (0.0 to 1.0)
+        distributed: Whether to use DistributedSampler for multi-GPU training
+        rank: Rank of current process (for distributed training)
+        world_size: Total number of processes (for distributed training)
 
     Returns:
-        DataLoader with integrated datasets
+        train_loader, val_loader: Training and validation DataLoaders
     """
+    import os
+    from pathlib import Path
+    from torch.utils.data import random_split, DistributedSampler
+
     datasets = []
 
-    # Add custom datasets (with or without sensor)
+    # If dataset_root is provided, scan for trajectory directories
+    if dataset_root:
+        dataset_root = Path(dataset_root)
+        # Look for subdirectories that contain trajectory data
+        # Skip cache and raw directories
+        skip_dirs = {'cache', 'raw', '__pycache__'}
+
+        for subdir in sorted(dataset_root.iterdir()):
+            if subdir.is_dir() and subdir.name not in skip_dirs:
+                # Check if this directory contains trajectory data
+                # Look for subdirectories with recv_all_* pattern or direct trajectory data
+                traj_paths = []
+                if list(subdir.glob('recv_all_*')):
+                    # Contains recv_all_* subdirectories
+                    traj_paths = [p for p in subdir.glob('recv_all_*') if p.is_dir()]
+                elif (subdir / 'positions_xyz.csv').exists() or (subdir / 'trajectory_data.json').exists():
+                    # Direct trajectory data
+                    traj_paths = [subdir]
+
+                for traj_dir in traj_paths:
+                    try:
+                        ds = insertionMeca500DatasetWithSensor(
+                            trajectory_dir=str(traj_dir),
+                            horizon=horizon
+                        )
+                        datasets.append(ds)
+                        sensor_status = "WITH sensor" if ds.has_sensor else "NO sensor"
+                        if rank == 0:
+                            print(f"✅ Added dataset: {traj_dir.name} ({len(ds)} samples, {sensor_status})")
+                    except Exception as e:
+                        if rank == 0:
+                            print(f"⚠️  Skipped {traj_dir}: {e}")
+
+    # Add specific trajectory directories if provided
     if trajectory_dirs:
         for traj_dir in trajectory_dirs:
             try:
@@ -837,9 +975,11 @@ def create_integrated_dataloader(
                 )
                 datasets.append(ds)
                 sensor_status = "WITH sensor" if ds.has_sensor else "NO sensor"
-                print(f"✅ Added custom dataset: {traj_dir} ({len(ds)} samples, {sensor_status})")
+                if rank == 0:
+                    print(f"✅ Added custom dataset: {traj_dir} ({len(ds)} samples, {sensor_status})")
             except Exception as e:
-                print(f"⚠️ Failed to load {traj_dir}: {e}")
+                if rank == 0:
+                    print(f"⚠️  Failed to load {traj_dir}: {e}")
 
     # Add Bridge dataset (without sensor)
     if bridge_root and os.path.exists(bridge_root):
@@ -850,9 +990,11 @@ def create_integrated_dataloader(
                 max_traj=bridge_max_traj
             )
             datasets.append(bridge_ds)
-            print(f"✅ Added Bridge dataset: {len(bridge_ds)} samples (NO sensor)")
+            if rank == 0:
+                print(f"✅ Added Bridge dataset: {len(bridge_ds)} samples (NO sensor)")
         except Exception as e:
-            print(f"⚠️ Failed to load Bridge dataset: {e}")
+            if rank == 0:
+                print(f"⚠️  Failed to load Bridge dataset: {e}")
 
     if not datasets:
         raise ValueError("No datasets loaded!")
@@ -863,19 +1005,74 @@ def create_integrated_dataloader(
     else:
         combined_dataset = ConcatDataset(datasets)
 
-    print(f"\n📊 Total dataset size: {len(combined_dataset)} samples")
+    if rank == 0:
+        print(f"\n📊 Total dataset size: {len(combined_dataset)} samples")
 
-    # Create DataLoader
-    dataloader = DataLoader(
-        combined_dataset,
+    # Split into train and validation sets
+    if val_split > 0:
+        val_size = int(len(combined_dataset) * val_split)
+        train_size = len(combined_dataset) - val_size
+        train_dataset, val_dataset = random_split(
+            combined_dataset,
+            [train_size, val_size],
+            generator=torch.manual_seed(42)
+        )
+        if rank == 0:
+            print(f"   Train: {train_size} samples")
+            print(f"   Val: {val_size} samples")
+    else:
+        train_dataset = combined_dataset
+        val_dataset = None
+        if rank == 0:
+            print(f"   Train: {len(train_dataset)} samples (no validation split)")
+
+    # Create samplers for distributed training
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        ) if val_dataset else None
+        # Don't shuffle in DataLoader when using DistributedSampler
+        train_shuffle = False
+    else:
+        train_sampler = None
+        val_sampler = None
+        train_shuffle = shuffle
+
+    # Create train DataLoader
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn_with_sensor,
         pin_memory=True
     )
 
-    return dataloader
+    # Create validation DataLoader
+    if val_dataset:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            collate_fn=collate_fn_with_sensor,
+            pin_memory=True
+        )
+    else:
+        val_loader = None
+
+    return train_loader, val_loader
 
 
 # =====================================
