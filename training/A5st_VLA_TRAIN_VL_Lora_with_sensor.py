@@ -437,32 +437,49 @@ def Train(
             if not hasattr(Train, "_best_loss"):
                 Train._best_loss = float("inf")
 
+            # Determine what to save based on training stage
+            model_module = model.module if hasattr(model, "module") else model
+            training_stage = getattr(Train, '_training_stage', 'stage2')
+
+            if training_stage == 'stage1':
+                # Stage 1: Save only Sensor Encoder + Action Expert
+                sensor_enabled = getattr(Train, '_sensor_enabled', True)
+                ckpt_data = {
+                    "epoch": epoch,
+                    "sensor_encoder": model_module.sensor_encoder.state_dict() if sensor_enabled else None,
+                    "action_expert": model_module.action_expert.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                    "val_loss": val_loss,
+                    "training_stage": "stage1",
+                }
+                stage_label = "[Stage 1]"
+            else:
+                # Stage 2: Save full model state
+                ckpt_data = {
+                    "epoch": epoch,
+                    "model_state_dict": model_module.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                    "val_loss": val_loss,
+                    "training_stage": "stage2",
+                }
+                stage_label = "[Stage 2]"
+
             is_best = val_loss is not None and val_loss < Train._best_loss
 
             if is_best:
                 Train._best_loss = val_loss
                 best_path = save_dir / "qwen_vla_sensor_best.pt"
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.module.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                    "val_loss": val_loss,
-                }, best_path)
-                print(f"🏆 [Best] Validation improved → saved to {best_path}")
+                torch.save(ckpt_data, best_path)
+                print(f"🏆 {stage_label} [Best] Validation improved → saved to {best_path}")
 
             else:
                 # Best가 아닌 경우 기존 latest만 덮어쓰기
                 tmp_path = base_path.with_suffix(".tmp")
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.module.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                    "val_loss": val_loss,
-                }, tmp_path)
+                torch.save(ckpt_data, tmp_path)
                 os.replace(tmp_path, base_path)
-                print(f"💾 [Sync] Latest checkpoint updated: {base_path}")
+                print(f"💾 {stage_label} [Sync] Latest checkpoint updated: {base_path}")
 
     if rank == 0 and writer is not None:
         writer.close()
@@ -516,6 +533,12 @@ def main():
                         help="Batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="Number of dataloader workers")
+
+    # 🔥 NEW: 2-Stage Training Arguments
+    parser.add_argument('--training-stage', type=str, choices=['stage1', 'stage2'], default='stage2',
+                        help='Training stage: stage1 (Sensor+Action only, VL frozen) or stage2 (Full model with LoRA)')
+    parser.add_argument('--stage1-checkpoint', type=str, default=None,
+                        help='Path to Stage 1 checkpoint (required for stage2 with finetune-vl != none)')
 
     args = parser.parse_args()
 
@@ -639,6 +662,14 @@ def main():
         if rank == 0:
             print("⏳ Initializing full QwenVLA model for training...")
 
+        # ✅ NEW: Validate Stage 2 requirements
+        if args.training_stage == 'stage2' and args.finetune_vl != 'none' and not args.stage1_checkpoint:
+            print("⚠️  WARNING: Stage 2 training without Stage 1 checkpoint. Training from scratch.")
+
+        if args.training_stage == 'stage1' and args.finetune_vl != 'none':
+            print("⚠️  WARNING: Stage 1 should use finetune-vl=none. Overriding to 'none'.")
+            args.finetune_vl = 'none'
+
         # ✅ NEW: Initialize sensor-enabled model
         model = Not_freeze_QwenVLAWithSensor(
             vl_model_name=vl_model_name,
@@ -657,6 +688,9 @@ def main():
             sensor_temporal_length=args.sensor_temporal_length,
             sensor_output_dim=args.sensor_output_dim,
             fusion_strategy=args.fusion_strategy,
+
+            # 🔥 NEW: Stage 1 checkpoint loading
+            stage1_checkpoint=args.stage1_checkpoint,
         ).to(device)
 
         # 전체 데이터셋 분할
@@ -819,6 +853,10 @@ def main():
                 print(f"🆕 [New] 0 → {target_lr:.2e} (warmup/hold/cosine)")
 
         save_path = './checkpoints/qwen_vla_sensor.pt'
+
+        # Store training stage for checkpoint saving
+        Train._training_stage = args.training_stage
+        Train._sensor_enabled = args.sensor_enabled
 
         # =======================================================
         # ✅ Train 호출

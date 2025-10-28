@@ -292,6 +292,25 @@ class CSVBasedDatasetWithSensor(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _fix_image_path(self, img_path: str) -> str:
+        """
+        Fix image paths that reference old dataset location
+
+        Converts: /home/najo/NAS/VLA/Insertion_VLA/dataset/...
+        To:       /home/najo/NAS/VLA/dataset/...
+
+        Also converts: /home/najo/NAS/VLA/dataset/part2/...
+        To:            /home/najo/NAS/VLA/dataset/part1/...
+        """
+        if "/Insertion_VLA/dataset/" in img_path:
+            img_path = img_path.replace("/Insertion_VLA/dataset/", "/dataset/")
+
+        # Fix part2 -> part1 path (datasets were merged into part1)
+        if "/dataset/part2/" in img_path:
+            img_path = img_path.replace("/dataset/part2/", "/dataset/part1/")
+
+        return img_path
+
     def __getitem__(self, idx):
         start_idx = self.samples[idx]
         t = start_idx
@@ -301,7 +320,7 @@ class CSVBasedDatasetWithSensor(Dataset):
         if t in self.image_index:
             for view_spec in self.available_views:
                 if view_spec in self.image_index[t]:
-                    img_path = self.image_index[t][view_spec]
+                    img_path = self._fix_image_path(self.image_index[t][view_spec])
                     views.append(f"file://{img_path}")
 
         # === Action sequence loading ===
@@ -490,6 +509,25 @@ class insertionMeca500DatasetWithSensor(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _fix_image_path(self, img_path: str) -> str:
+        """
+        Fix image paths that reference old dataset location
+
+        Converts: /home/najo/NAS/VLA/Insertion_VLA/dataset/...
+        To:       /home/najo/NAS/VLA/dataset/...
+
+        Also converts: /home/najo/NAS/VLA/dataset/part2/...
+        To:            /home/najo/NAS/VLA/dataset/part1/...
+        """
+        if "/Insertion_VLA/dataset/" in img_path:
+            img_path = img_path.replace("/Insertion_VLA/dataset/", "/dataset/")
+
+        # Fix part2 -> part1 path (datasets were merged into part1)
+        if "/dataset/part2/" in img_path:
+            img_path = img_path.replace("/dataset/part2/", "/dataset/part1/")
+
+        return img_path
+
     def __getitem__(self, idx):
         start_idx = self.samples[idx]
         t = start_idx
@@ -503,11 +541,11 @@ class insertionMeca500DatasetWithSensor(Dataset):
             image_paths_dict = current_data_point['images']
             for view_key in self.available_views:
                 if view_key in image_paths_dict:
-                    img_path = image_paths_dict[view_key]
+                    img_path = self._fix_image_path(image_paths_dict[view_key])
                     views.append(f"file://{img_path}")
         elif 'image' in current_data_point:
             # Single view JSON
-            img_path = current_data_point['image']
+            img_path = self._fix_image_path(current_data_point['image'])
             views.append(f"file://{img_path}")
 
         # === Action sequence loading ===

@@ -581,6 +581,8 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                  sensor_output_dim=3072,
                  # Fusion params
                  fusion_strategy='concat',
+                 # Stage 2 checkpoint loading
+                 stage1_checkpoint=None,
                  ):
         super().__init__()
 
@@ -588,6 +590,8 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
         print(f"   VL Fine-tuning: {finetune_vl}")
         print(f"   Sensor Enabled: {sensor_enabled}")
         print(f"   Fusion Strategy: {fusion_strategy}")
+        if stage1_checkpoint:
+            print(f"   Stage 1 Checkpoint: {stage1_checkpoint}")
 
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -625,6 +629,10 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
             hidden_dim=hidden_dim,
             fusion_strategy=fusion_strategy if sensor_enabled else 'none'
         ).to(dtype=torch.bfloat16)
+
+        # 🔹 Load Stage 1 checkpoint if provided (before LoRA injection)
+        if stage1_checkpoint:
+            self._load_stage1_checkpoint(stage1_checkpoint)
 
         # 🔹 Fine-tuning setup
         for p in self.vl_model.parameters():
@@ -697,6 +705,23 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
 
         raise RuntimeError("❌ All dtype/attention fallback attempts failed.")
 
+    def _load_stage1_checkpoint(self, checkpoint_path):
+        """Load Stage 1 checkpoint (Sensor Encoder + Action Expert only)"""
+        print(f"📥 Loading Stage 1 checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        # Load sensor encoder state
+        if self.sensor_enabled and 'sensor_encoder' in checkpoint:
+            self.sensor_encoder.load_state_dict(checkpoint['sensor_encoder'])
+            print("   ✅ Loaded Sensor Encoder from Stage 1")
+
+        # Load action expert state
+        if 'action_expert' in checkpoint:
+            self.action_expert.load_state_dict(checkpoint['action_expert'])
+            print("   ✅ Loaded Regression Action Expert from Stage 1")
+
+        print("✅ Stage 1 checkpoint loaded successfully")
+
     def _inject_lora_to_vl(self, r, alpha, dropout):
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
         cfg = LoraConfig(
@@ -706,6 +731,9 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
         self.vl_model = get_peft_model(self.vl_model, cfg)
         for n, p in self.vl_model.named_parameters():
             p.requires_grad = "lora" in n
+
+        trainable = sum(p.numel() for p in self.vl_model.parameters() if p.requires_grad)
+        print(f"   LoRA trainable parameters: {trainable:,}")
 
     def _selective_unfreeze_vl(self, last_n=2):
         blocks = None
