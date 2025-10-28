@@ -849,7 +849,7 @@ if __name__ == "__main__":
     print("="*80)
 
     # Test 1: CSV-based Dataset WITH sensor data (White_silicone_white_circle)
-    test_dir_with_sensor = "/home/najo/NAS/VLA/Insertion_VLA/dataset/White_silicone_white_circle/recv_all_20251027_165107"
+    test_dir_with_sensor = "/home/najo/NAS/VLA/dataset/White_silicone_white_circle/recv_all_20251027_165107"
 
     if os.path.exists(test_dir_with_sensor):
         print(f"\n🧪 Test 1: CSV-based Dataset WITH sensor data")
@@ -869,8 +869,8 @@ if __name__ == "__main__":
         print(f"   Sensor data: {sample['sensor_data'].shape if sample['sensor_data'] is not None else 'None'}")
         print(f"   Instruction: {sample['instruction']}")
 
-    # Test 2: Dataset WITHOUT sensor data (OCT_insertion - if exists)
-    test_dir_no_sensor = "/home/najo/NAS/VLA/Insertion_VLA/dataset/OCT_insertion/Captures1"
+    # Test 2: Dataset WITHOUT sensor data (OCT_`insertion` - if exists)
+    test_dir_no_sensor = "/home/najo/NAS/VLA/dataset/OCT_insertion/Captures1"
 
     if os.path.exists(test_dir_no_sensor):
         print(f"\n🧪 Test 2: Dataset WITHOUT sensor data")

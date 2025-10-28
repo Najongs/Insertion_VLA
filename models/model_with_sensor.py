@@ -905,9 +905,9 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
 # Backward Compatibility Aliases
 # =====================================
 # Keep original classes for backward compatibility
-from model import QwenActionExpert as QwenActionExpert_Original
-from model import QwenVLAForAction as QwenVLAForAction_Original
-from model import Not_freeze_QwenVLAForAction as Not_freeze_QwenVLAForAction_Original
+from models.model import QwenActionExpert as QwenActionExpert_Original
+from models.model import QwenVLAForAction as QwenVLAForAction_Original
+from models.model import Not_freeze_QwenVLAForAction as Not_freeze_QwenVLAForAction_Original
 
 __all__ = [
     'SensorEncoder',

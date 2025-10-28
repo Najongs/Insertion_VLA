@@ -13,7 +13,7 @@ import torch.distributed as dist
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import DataLoader, DistributedSampler
 
-from Total_Dataset import collate_fn
+from vla_datasets.Total_Dataset import collate_fn
 
 # =====================================
 # 1️⃣ Action Expert (Temporal Decoder)
