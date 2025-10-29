@@ -54,7 +54,7 @@ SEND_ZED_RIGHT = False
 
 # ZMQ 최적화
 ZMQ_IO_THREADS = 4
-CAMERA_SNDHWM = 1000  # 5Hz이므로 버퍼 줄임
+CAMERA_SNDHWM = 5 # 5Hz이므로 버퍼 줄임
 SNDBUF_SIZE = 32 * 1024 * 1024  # 32MB
 
 # 인코딩 병렬화
@@ -427,7 +427,7 @@ class FastCameraSender(threading.Thread):
 
 # ===================== ZED 카메라 캡처 =====================
 def zed_camera_process(serial, trigger_event, sender, stop_event):
-    """ZED 카메라 캡처 (Left만)"""
+    """ZED 카메라 캡처 (Left만) - Rising Edge 방식"""
     cam_name = f"ZED_{serial}_left"
     print(f"🎥 Starting {cam_name}...")
 
@@ -437,6 +437,8 @@ def zed_camera_process(serial, trigger_event, sender, stop_event):
     init_params.camera_fps = 30
     init_params.set_from_serial_number(int(serial))
     init_params.depth_mode = sl.DEPTH_MODE.NONE
+    init_params.camera_disable_self_calib = True
+    init_params.enable_image_enhancement = False
 
     status = zed.open(init_params)
     if status != sl.ERROR_CODE.SUCCESS:
@@ -446,26 +448,33 @@ def zed_camera_process(serial, trigger_event, sender, stop_event):
     print(f"✅ {cam_name} opened")
 
     mat_left = sl.Mat()
+    runtime = sl.RuntimeParameters()
+    runtime.enable_depth = False
     frame_count = 0
 
+    # Rising edge 검출용
+    last_trigger = False
+
     while not stop_event.is_set():
-        # 트리거 대기
-        trigger_event.wait(timeout=1.0)
+        # 현재 트리거 상태 확인
+        current = trigger_event.is_set()
 
-        if stop_event.is_set():
-            break
+        # Rising edge 검출: 이전에 False였다가 True가 되는 순간만 캡처
+        if current and not last_trigger:
+            # 프레임 캡처
+            if zed.grab(runtime) == sl.ERROR_CODE.SUCCESS:
+                timestamp = time.time()
+                zed.retrieve_image(mat_left, sl.VIEW.LEFT)
 
-        # 프레임 캡처
-        if zed.grab() == sl.ERROR_CODE.SUCCESS:
-            timestamp = time.time()
-            zed.retrieve_image(mat_left, sl.VIEW.LEFT)
+                # NumPy 변환 및 복사
+                frame_left = mat_left.get_data()[:, :, :3].copy()  # BGRA → BGR
 
-            # NumPy 변환
-            frame_left = mat_left.get_data()[:, :, :3]  # BGRA → BGR
+                # 전송
+                sender.submit_frame(cam_name, frame_left, timestamp)
+                frame_count += 1
 
-            # 전송
-            sender.submit_frame(cam_name, frame_left, timestamp)
-            frame_count += 1
+        last_trigger = current
+        time.sleep(0.0002)  # 0.2ms (고속 폴링)
 
     zed.close()
     print(f"🛑 {cam_name} stopped (frames: {frame_count})")
@@ -473,7 +482,7 @@ def zed_camera_process(serial, trigger_event, sender, stop_event):
 
 # ===================== OAK 카메라 캡처 =====================
 def oak_camera_process(trigger_event, sender, stop_event):
-    """OAK 카메라 캡처"""
+    """OAK 카메라 캡처 - Rising Edge 방식"""
     cam_name = "OAK"
     print(f"🎥 Starting {cam_name}...")
 
@@ -483,8 +492,10 @@ def oak_camera_process(trigger_event, sender, stop_event):
     cam_rgb = pipeline.create(dai.node.ColorCamera)
     cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
     cam_rgb.setBoardSocket(dai.CameraBoardSocket.RGB)
+    cam_rgb.setFps(60)  # 명시적으로 FPS 설정
     cam_rgb.setInterleaved(False)
     cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    cam_rgb.initialControl.setManualFocus(105)
 
     xout_rgb = pipeline.create(dai.node.XLinkOut)
     xout_rgb.setStreamName("rgb")
@@ -501,22 +512,29 @@ def oak_camera_process(trigger_event, sender, stop_event):
     q_rgb = device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
     frame_count = 0
 
+    # Rising edge 검출용
+    last_trigger = False
+
     while not stop_event.is_set():
-        # 트리거 대기
-        trigger_event.wait(timeout=1.0)
+        # 현재 트리거 상태 확인
+        current = trigger_event.is_set()
 
-        if stop_event.is_set():
-            break
+        # Rising edge 검출: 이전에 False였다가 True가 되는 순간만 캡처
+        if current and not last_trigger:
+            # 큐에 쌓인 모든 프레임을 버리고 최신 프레임만 가져오기
+            frame = None
+            while q_rgb.has():
+                frame = q_rgb.get()
 
-        # 프레임 가져오기
-        in_rgb = q_rgb.tryGet()
-        if in_rgb is not None:
-            timestamp = time.time()
-            frame = in_rgb.getCvFrame()
+            # 최신 프레임이 있으면 전송
+            if frame is not None:
+                timestamp = time.time()
+                img = frame.getCvFrame()
+                sender.submit_frame(cam_name, img, timestamp)
+                frame_count += 1
 
-            # 전송
-            sender.submit_frame(cam_name, frame, timestamp)
-            frame_count += 1
+        last_trigger = current
+        time.sleep(0.0002)  # 0.2ms (고속 폴링)
 
     device.close()
     print(f"🛑 {cam_name} stopped (frames: {frame_count})")
