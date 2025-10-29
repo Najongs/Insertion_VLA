@@ -309,6 +309,7 @@ class AsyncVLAInferenceEngine:
             fusion_strategy=config.FUSION_STRATEGY,
             image_resize_height=config.IMAGE_RESIZE_HEIGHT,
             image_resize_width=config.IMAGE_RESIZE_WIDTH,
+            device_map="cuda",  # Use single GPU for inference instead of "auto"
         )
 
         # Load checkpoint if provided
@@ -412,17 +413,8 @@ class AsyncVLAInferenceEngine:
             if self.config.SENSOR_ENABLED and sensor_batch is not None:
                 sensor_features = self.model.sensor_encoder(sensor_batch)  # (1, sensor_dim)
 
-            # Fuse VL + Sensor features
-            if sensor_features is not None:
-                if self.config.FUSION_STRATEGY == 'concat':
-                    fused_features = torch.cat([vl_features, sensor_features], dim=-1)
-                else:
-                    fused_features = vl_features
-            else:
-                fused_features = vl_features
-
-            # Predict actions using Action Expert
-            pred_actions, delta = self.model.action_expert(fused_features, z_chunk)
+            # Predict actions using Action Expert (it handles fusion internally)
+            pred_actions, delta = self.model.action_expert(vl_features, z_chunk, sensor_features)
 
         elapsed = time.time() - start_time
 
@@ -432,8 +424,8 @@ class AsyncVLAInferenceEngine:
             self.action_times.append(elapsed)
 
         return {
-            'actions': pred_actions[0].cpu().numpy(),  # (H, action_dim)
-            'delta': delta[0].cpu().numpy(),
+            'actions': pred_actions[0].float().cpu().numpy(),  # (H, action_dim)
+            'delta': delta[0].float().cpu().numpy(),
             'inference_time': elapsed,
             'timestamp': time.time(),
         }
