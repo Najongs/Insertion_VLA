@@ -618,6 +618,8 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                  # Image resize params (for faster inference)
                  image_resize_height=None,
                  image_resize_width=None,
+                 # Device map control (for inference use "cuda" instead of "auto")
+                 device_map="auto",
                  ):
         super().__init__()
 
@@ -637,6 +639,7 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
         self.strict_cache = False
         self.action_dim = action_dim
         self.horizon = horizon
+        self.device_map = device_map
 
         # 🔹 VL Model
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
@@ -648,7 +651,7 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
             self.processor.image_processor.max_pixels = target_pixels
             print(f"   📐 Image resize: {image_resize_width}x{image_resize_height} ({target_pixels:,} pixels)")
 
-        self.vl_model = self._load_qwen_with_fallback(vl_model_name)
+        self.vl_model = self._load_qwen_with_fallback(vl_model_name, device_map)
 
         # 🔹 Sensor Encoder (Trainable)
         if sensor_enabled:
@@ -707,10 +710,12 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
         except (TypeError, ValueError):
             raise ValueError("limit_gb must be convertible to float") from None
 
-    def _load_qwen_with_fallback(self, vl_model_name):
+    def _load_qwen_with_fallback(self, vl_model_name, device_map="auto"):
         """Load Qwen-VL with attention implementation fallback"""
         dtype_candidates = [torch.bfloat16, torch.float16]
         attn_candidates = ["flash_attention_2", "sdpa"]
+
+        print(f"   📍 Device map: {device_map}")
 
         for dtype in dtype_candidates:
             for impl in attn_candidates:
@@ -720,7 +725,7 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                         vl_model_name,
                         torch_dtype=dtype,
                         attn_implementation=impl,
-                        device_map="auto",
+                        device_map=device_map,
                         low_cpu_mem_usage=True,
                     )
                     print(f"✅ Successfully loaded with {impl} ({dtype})")
@@ -736,7 +741,7 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     vl_model_name,
                     torch_dtype=dtype,
-                    device_map="auto",
+                    device_map=device_map,
                     low_cpu_mem_usage=True,
                 )
                 print(f"✅ Successfully loaded with default attention ({dtype})")
@@ -905,6 +910,90 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                 )
         finally:
             self.cache_mode = prev_mode
+
+    def _encode_vision_features(self, text_inputs, image_inputs, cache_keys, use_cache, device):
+        """
+        Encode VL features with caching - used by async inference receiver
+
+        Args:
+            text_inputs: List of text prompts
+            image_inputs: List of image paths (multi-view)
+            cache_keys: Cache keys for VL features
+            use_cache: Whether to use caching
+            device: Target device
+        Returns:
+            vl_tokens: (B, 1, vl_dim) - pooled VL tokens
+        """
+        pooled_vl_tokens_dict = {}
+        miss_items = []
+
+        if use_cache:
+            for txt, views, key in zip(text_inputs, image_inputs, cache_keys):
+                cache_path = self._cache_path(key, txt, views)
+                if cache_path.exists():
+                    pooled = torch.load(cache_path, map_location="cpu")
+                    pooled = pooled.pin_memory().to(device=device, non_blocking=True, dtype=torch.bfloat16)
+                    pooled_vl_tokens_dict[key] = pooled
+                else:
+                    miss_items.append((txt, views, key))
+        else:
+            miss_items = list(zip(text_inputs, image_inputs, cache_keys))
+
+        def preprocess_message(args):
+            txt, views, key = args
+            msg_content = [{"type": "image", "image": v} for v in views if v is not None]
+            msg_content.append({"type": "text", "text": txt})
+            messages = [{"role": "user", "content": msg_content}]
+            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            vision_inputs, video_inputs = process_vision_info(messages)
+            return key, txt, views, text, vision_inputs, video_inputs
+
+        if miss_items and use_cache and getattr(self, "strict_cache", False):
+            missing_keys = [key for _, _, key in miss_items]
+            raise FileNotFoundError(f"Missing cached features for keys: {missing_keys}")
+
+        if miss_items:
+            with ThreadPoolExecutor(max_workers=24) as executor:
+                results = list(executor.map(preprocess_message, miss_items))
+
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                for key, txt, views, text, vision_inputs, video_inputs in results:
+                    if use_cache:
+                        cache_path = self._cache_path(key, txt, views)
+                        if cache_path.exists():
+                            pooled = torch.load(cache_path, map_location="cpu")
+                            pooled = pooled.pin_memory().to(device=device, non_blocking=True, dtype=torch.bfloat16)
+                            pooled_vl_tokens_dict[key] = pooled
+                            continue
+
+                    inputs = self.processor(
+                        text=[text],
+                        images=vision_inputs,
+                        videos=video_inputs,
+                        padding=True,
+                        return_tensors="pt"
+                    )
+
+                    # Move inputs to the VL model device
+                    vl_device = next(self.vl_model.parameters()).device
+                    inputs = {k: v.to(vl_device) if isinstance(v, torch.Tensor) else v
+                             for k, v in inputs.items()}
+
+                    outputs = self.vl_model(**inputs, output_hidden_states=True, return_dict=True)
+                    vl_tokens = outputs.hidden_states[-1]
+                    pooled = vl_tokens.mean(dim=1, keepdim=True)
+
+                    if use_cache:
+                        cache_path = self._cache_path(key, txt, views)
+                        self._atomic_save(pooled.detach().to("cpu", dtype=torch.float16), cache_path)
+                        self._enforce_cache_limit()
+
+                    pooled_vl_tokens_dict[key] = pooled.to(dtype=torch.bfloat16)
+
+        pooled_vl_tokens = [pooled_vl_tokens_dict[k] for k in cache_keys if k in pooled_vl_tokens_dict]
+        vl_tokens = torch.cat(pooled_vl_tokens, dim=0)  # (B, 1, vl_dim)
+
+        return vl_tokens
 
     def forward(self,
                 text_inputs,

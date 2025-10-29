@@ -10,7 +10,7 @@ dataset/
 wandb/
 checkpoints/
 inference_session*/
-
+async_inference_*/
 # Hugging Face uploads and downloads
 hf_upload_temp/
 downloaded_models/
