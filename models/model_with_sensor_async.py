@@ -73,6 +73,9 @@ class AsyncQwenVLAWithSensor(Not_freeze_QwenVLAWithSensor):
         fusion_strategy='concat',
         # Stage 2 checkpoint loading
         stage1_checkpoint=None,
+        # Image resize params (for faster inference)
+        image_resize_height=None,
+        image_resize_width=None,
         # Async params
         vlm_reuse_count=3,  # 🔥 NEW: VL feature reuse count
     ):
@@ -100,6 +103,8 @@ class AsyncQwenVLAWithSensor(Not_freeze_QwenVLAWithSensor):
             sensor_output_dim=sensor_output_dim,
             fusion_strategy=fusion_strategy,
             stage1_checkpoint=stage1_checkpoint,
+            image_resize_height=image_resize_height,
+            image_resize_width=image_resize_width,
         )
 
         print(f"🔄 Async VLA initialized:")
@@ -231,6 +236,8 @@ def create_async_model(
     finetune_vl="lora",
     sensor_window_size=65,
     vlm_reuse_count=3,
+    image_resize_height=None,
+    image_resize_width=None,
     **kwargs
 ):
     """
@@ -241,6 +248,8 @@ def create_async_model(
         finetune_vl: VL fine-tuning mode ("none", "lora", "full")
         sensor_window_size: Sensor window size (default: 65)
         vlm_reuse_count: VL feature reuse count (default: 3)
+        image_resize_height: Image resize height (e.g., 360 for 640x360)
+        image_resize_width: Image resize width (e.g., 640 for 640x360)
         **kwargs: Additional model arguments
     """
     model = AsyncQwenVLAWithSensor(
@@ -253,6 +262,8 @@ def create_async_model(
         sensor_temporal_length=sensor_window_size,
         vlm_reuse_count=vlm_reuse_count,
         stage1_checkpoint=stage1_checkpoint,
+        image_resize_height=image_resize_height,
+        image_resize_width=image_resize_width,
         **kwargs
     )
 

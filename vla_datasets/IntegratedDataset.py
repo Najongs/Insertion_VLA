@@ -905,6 +905,7 @@ def create_integrated_dataloader(
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
+    priority_datasets: dict = None,  # NEW: {"dataset_name": weight}
 ):
     """
     Create train and validation DataLoaders with integrated datasets
@@ -922,15 +923,18 @@ def create_integrated_dataloader(
         distributed: Whether to use DistributedSampler for multi-GPU training
         rank: Rank of current process (for distributed training)
         world_size: Total number of processes (for distributed training)
+        priority_datasets: Dict of dataset names and their sampling weights
+                          e.g., {"Needle_insertion_eye_trocar": 2.0, "White_silicone_white_circle": 2.0}
 
     Returns:
         train_loader, val_loader: Training and validation DataLoaders
     """
     import os
     from pathlib import Path
-    from torch.utils.data import random_split, DistributedSampler
+    from torch.utils.data import random_split, DistributedSampler, WeightedRandomSampler
 
     datasets = []
+    dataset_names = []  # Track dataset names for weighted sampling
 
     # If dataset_root is provided, scan for trajectory directories
     if dataset_root:
@@ -958,6 +962,8 @@ def create_integrated_dataloader(
                             horizon=horizon
                         )
                         datasets.append(ds)
+                        # Track dataset name (parent directory name)
+                        dataset_names.append(traj_dir.parent.name)
                         sensor_status = "WITH sensor" if ds.has_sensor else "NO sensor"
                         if rank == 0:
                             print(f"✅ Added dataset: {traj_dir.name} ({len(ds)} samples, {sensor_status})")
@@ -974,6 +980,10 @@ def create_integrated_dataloader(
                     horizon=horizon
                 )
                 datasets.append(ds)
+                # Track dataset name (directory name or parent name)
+                traj_path = Path(traj_dir)
+                dataset_name = traj_path.parent.name if 'recv_all_' in traj_path.name else traj_path.name
+                dataset_names.append(dataset_name)
                 sensor_status = "WITH sensor" if ds.has_sensor else "NO sensor"
                 if rank == 0:
                     print(f"✅ Added custom dataset: {traj_dir} ({len(ds)} samples, {sensor_status})")
@@ -990,6 +1000,7 @@ def create_integrated_dataloader(
                 max_traj=bridge_max_traj
             )
             datasets.append(bridge_ds)
+            dataset_names.append("Bridge")
             if rank == 0:
                 print(f"✅ Added Bridge dataset: {len(bridge_ds)} samples (NO sensor)")
         except Exception as e:
@@ -1026,8 +1037,62 @@ def create_integrated_dataloader(
         if rank == 0:
             print(f"   Train: {len(train_dataset)} samples (no validation split)")
 
-    # Create samplers for distributed training
-    if distributed:
+    # Create weighted sampler if priority_datasets is specified
+    train_sampler = None
+    val_sampler = None
+    train_shuffle = shuffle
+
+    if priority_datasets and not distributed:
+        # Create sample weights based on dataset priority
+        sample_weights = []
+
+        # Get actual indices from train_dataset (which may be a Subset after random_split)
+        if hasattr(train_dataset, 'indices'):
+            # train_dataset is a Subset, get original indices
+            train_indices = train_dataset.indices
+        else:
+            # train_dataset is the full dataset
+            train_indices = list(range(len(train_dataset)))
+
+        # If using ConcatDataset, track which samples belong to which dataset
+        if isinstance(combined_dataset, ConcatDataset):
+            cumulative_sizes = combined_dataset.cumulative_sizes
+            for orig_idx in train_indices:
+                # Find which dataset this sample belongs to
+                dataset_idx = 0
+                for i, cum_size in enumerate(cumulative_sizes):
+                    if orig_idx < cum_size:
+                        dataset_idx = i
+                        break
+
+                # Get dataset name and weight
+                dataset_name = dataset_names[dataset_idx]
+                weight = priority_datasets.get(dataset_name, 1.0)
+                sample_weights.append(weight)
+        else:
+            # Single dataset
+            dataset_name = dataset_names[0] if dataset_names else "unknown"
+            weight = priority_datasets.get(dataset_name, 1.0)
+            sample_weights = [weight] * len(train_dataset)
+
+        # Create weighted sampler
+        sample_weights_tensor = torch.tensor(sample_weights, dtype=torch.float)
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights_tensor,
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+        train_shuffle = False  # Don't shuffle when using WeightedRandomSampler
+
+        if rank == 0 and priority_datasets:
+            print(f"\n⚖️  Weighted sampling enabled:")
+            for name, weight in priority_datasets.items():
+                matching_count = sum(1 for dn in dataset_names if name in dn)
+                if matching_count > 0:
+                    print(f"   {name}: {weight}x weight")
+
+    # Create samplers for distributed training (overrides weighted sampler)
+    elif distributed:
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -1040,12 +1105,10 @@ def create_integrated_dataloader(
             rank=rank,
             shuffle=False
         ) if val_dataset else None
-        # Don't shuffle in DataLoader when using DistributedSampler
         train_shuffle = False
-    else:
-        train_sampler = None
-        val_sampler = None
-        train_shuffle = shuffle
+
+        if rank == 0 and priority_datasets:
+            print(f"\n⚠️  Note: Weighted sampling not supported with DistributedSampler")
 
     # Create train DataLoader
     train_loader = DataLoader(

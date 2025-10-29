@@ -1,0 +1,397 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+📸 Found 5 views
+
+################################################################################
+# Testing with 2 views
+################################################################################
+🚀 Loading Qwen2.5-VL-3B...
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.32s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.15s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.18s/it]
+The image processor of type `Qwen2VLImageProcessor` is now loaded as a fast processor by default, even if the model checkpoint was saved with a slow processor. This is a breaking change and may produce slightly different outputs. To continue using the slow processor, instantiate this class with `use_fast=False`. Note that this behavior will be extended to all models in a future release.
+/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/conv.py:605: UserWarning: Plan failed with a cudnnException: CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnFinalize Descriptor Failed cudnn_status: CUDNN_STATUS_NOT_SUPPORTED (Triggered internally at ../aten/src/ATen/native/cudnn/Conv_v8.cpp:919.)
+  return F.conv3d(
+✅ Model loaded
+📸 Testing with 2 views
+
+============================================================
+Testing resolution: 1280x720
+============================================================
+Original sizes: (1280, 720)
+Resized to: 1280x720
+Pixel reduction: 1.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 583.47 ms
+  [10/20] Current avg: 583.96 ms
+  [15/20] Current avg: 583.72 ms
+  [20/20] Current avg: 583.06 ms
+
+📊 Results:
+  Mean: 583.06 ms (1.72 Hz)
+  Std:  2.32 ms
+
+============================================================
+Testing resolution: 960x540
+============================================================
+Original sizes: (1280, 720)
+Resized to: 960x540
+Pixel reduction: 1.78x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 338.03 ms
+  [10/20] Current avg: 337.44 ms
+  [15/20] Current avg: 337.53 ms
+  [20/20] Current avg: 337.50 ms
+
+📊 Results:
+  Mean: 337.50 ms (2.96 Hz)
+  Std:  1.43 ms
+
+============================================================
+Testing resolution: 640x360
+============================================================
+Original sizes: (1280, 720)
+Resized to: 640x360
+Pixel reduction: 4.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 163.70 ms
+  [10/20] Current avg: 163.62 ms
+  [15/20] Current avg: 163.62 ms
+  [20/20] Current avg: 163.65 ms
+
+📊 Results:
+  Mean: 163.65 ms (6.11 Hz)
+  Std:  0.72 ms
+
+============================================================
+Testing resolution: 480x270
+============================================================
+Original sizes: (1280, 720)
+Resized to: 480x270
+Pixel reduction: 7.11x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 105.86 ms
+  [10/20] Current avg: 106.03 ms
+  [15/20] Current avg: 105.93 ms
+  [20/20] Current avg: 105.93 ms
+
+📊 Results:
+  Mean: 105.93 ms (9.44 Hz)
+  Std:  0.32 ms
+
+================================================================================
+📊 Resolution Comparison Summary
+================================================================================
+
+Resolution      Time (ms)    Speedup    Hz       Action Expert Reuse 
+--------------------------------------------------------------------------------
+1280x720        583.1        1.00      x 1.72     5x
+480x270         105.9        5.50      x 9.44     1x
+640x360         163.6        3.56      x 6.11     1x
+960x540         337.5        1.73      x 2.96     3x
+
+💡 Recommendations:
+--------------------------------------------------------------------------------
+Best speedup: 960x540 → 1.73x faster
+
+✅ Recommended: 480x270
+   - VLM time: 106ms
+   - VL feature reuse: 1x
+   - Action Expert: 10 Hz (100ms period)
+
+✅ Results saved to resolution_test_2views.json
+
+################################################################################
+# Testing with 3 views
+################################################################################
+🚀 Loading Qwen2.5-VL-3B...
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.30s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.14s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.17s/it]
+✅ Model loaded
+📸 Testing with 3 views
+
+============================================================
+Testing resolution: 1280x720
+============================================================
+Original sizes: (1280, 720)
+Resized to: 1280x720
+Pixel reduction: 1.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 879.76 ms
+  [10/20] Current avg: 880.89 ms
+  [15/20] Current avg: 881.44 ms
+  [20/20] Current avg: 881.77 ms
+
+📊 Results:
+  Mean: 881.77 ms (1.13 Hz)
+  Std:  1.61 ms
+
+============================================================
+Testing resolution: 960x540
+============================================================
+Original sizes: (1280, 720)
+Resized to: 960x540
+Pixel reduction: 1.78x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 495.17 ms
+  [10/20] Current avg: 495.23 ms
+  [15/20] Current avg: 495.34 ms
+  [20/20] Current avg: 495.43 ms
+
+📊 Results:
+  Mean: 495.43 ms (2.02 Hz)
+  Std:  0.68 ms
+
+============================================================
+Testing resolution: 640x360
+============================================================
+Original sizes: (1280, 720)
+Resized to: 640x360
+Pixel reduction: 4.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 246.49 ms
+  [10/20] Current avg: 246.48 ms
+  [15/20] Current avg: 246.35 ms
+  [20/20] Current avg: 246.41 ms
+
+📊 Results:
+  Mean: 246.41 ms (4.06 Hz)
+  Std:  0.43 ms
+
+============================================================
+Testing resolution: 480x270
+============================================================
+Original sizes: (1280, 720)
+Resized to: 480x270
+Pixel reduction: 7.11x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 144.19 ms
+  [10/20] Current avg: 144.19 ms
+  [15/20] Current avg: 144.31 ms
+  [20/20] Current avg: 144.42 ms
+
+📊 Results:
+  Mean: 144.42 ms (6.92 Hz)
+  Std:  0.33 ms
+
+================================================================================
+📊 Resolution Comparison Summary
+================================================================================
+
+Resolution      Time (ms)    Speedup    Hz       Action Expert Reuse 
+--------------------------------------------------------------------------------
+1280x720        881.8        1.00      x 1.13     8x
+480x270         144.4        6.11      x 6.92     1x
+640x360         246.4        3.58      x 4.06     2x
+960x540         495.4        1.78      x 2.02     4x
+
+💡 Recommendations:
+--------------------------------------------------------------------------------
+Best speedup: 960x540 → 1.78x faster
+
+✅ Recommended: 480x270
+   - VLM time: 144ms
+   - VL feature reuse: 1x
+   - Action Expert: 10 Hz (100ms period)
+
+✅ Results saved to resolution_test_3views.json
+
+################################################################################
+# Testing with 4 views
+################################################################################
+🚀 Loading Qwen2.5-VL-3B...
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.29s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.13s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.15s/it]
+✅ Model loaded
+📸 Testing with 4 views
+
+============================================================
+Testing resolution: 1280x720
+============================================================
+Original sizes: (1280, 720)
+Resized to: 1280x720
+Pixel reduction: 1.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 1168.68 ms
+  [10/20] Current avg: 1168.99 ms
+  [15/20] Current avg: 1169.62 ms
+  [20/20] Current avg: 1170.96 ms
+
+📊 Results:
+  Mean: 1170.96 ms (0.85 Hz)
+  Std:  2.55 ms
+
+============================================================
+Testing resolution: 960x540
+============================================================
+Original sizes: (1280, 720)
+Resized to: 960x540
+Pixel reduction: 1.78x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 647.48 ms
+  [10/20] Current avg: 647.42 ms
+  [15/20] Current avg: 647.54 ms
+  [20/20] Current avg: 647.65 ms
+
+📊 Results:
+  Mean: 647.65 ms (1.54 Hz)
+  Std:  0.80 ms
+
+============================================================
+Testing resolution: 640x360
+============================================================
+Original sizes: (1280, 720)
+Resized to: 640x360
+Pixel reduction: 4.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 309.88 ms
+  [10/20] Current avg: 310.09 ms
+  [15/20] Current avg: 310.08 ms
+  [20/20] Current avg: 310.08 ms
+
+📊 Results:
+  Mean: 310.08 ms (3.22 Hz)
+  Std:  0.39 ms
+
+============================================================
+Testing resolution: 480x270
+============================================================
+Original sizes: (1280, 720)
+Resized to: 480x270
+Pixel reduction: 7.11x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 199.37 ms
+  [10/20] Current avg: 199.32 ms
+  [15/20] Current avg: 199.38 ms
+  [20/20] Current avg: 199.37 ms
+
+📊 Results:
+  Mean: 199.37 ms (5.02 Hz)
+  Std:  0.26 ms
+
+================================================================================
+📊 Resolution Comparison Summary
+================================================================================
+
+Resolution      Time (ms)    Speedup    Hz       Action Expert Reuse 
+--------------------------------------------------------------------------------
+1280x720        1171.0       1.00      x 0.85     11x
+480x270         199.4        5.87      x 5.02     1x
+640x360         310.1        3.78      x 3.22     3x
+960x540         647.6        1.81      x 1.54     6x
+
+💡 Recommendations:
+--------------------------------------------------------------------------------
+Best speedup: 960x540 → 1.81x faster
+
+✅ Recommended: 480x270
+   - VLM time: 199ms
+   - VL feature reuse: 1x
+   - Action Expert: 10 Hz (100ms period)
+
+✅ Results saved to resolution_test_4views.json
+
+################################################################################
+# Testing with 5 views
+################################################################################
+🚀 Loading Qwen2.5-VL-3B...
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.29s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.13s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.15s/it]
+✅ Model loaded
+📸 Testing with 5 views
+
+============================================================
+Testing resolution: 1280x720
+============================================================
+Original sizes: (1280, 720)
+Resized to: 1280x720
+Pixel reduction: 1.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 1482.59 ms
+  [10/20] Current avg: 1483.89 ms
+  [15/20] Current avg: 1485.87 ms
+  [20/20] Current avg: 1487.25 ms
+
+📊 Results:
+  Mean: 1487.25 ms (0.67 Hz)
+  Std:  3.84 ms
+
+============================================================
+Testing resolution: 960x540
+============================================================
+Original sizes: (1280, 720)
+Resized to: 960x540
+Pixel reduction: 1.78x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 800.97 ms
+  [10/20] Current avg: 801.09 ms
+  [15/20] Current avg: 801.20 ms
+  [20/20] Current avg: 801.35 ms
+
+📊 Results:
+  Mean: 801.35 ms (1.25 Hz)
+  Std:  0.55 ms
+
+============================================================
+Testing resolution: 640x360
+============================================================
+Original sizes: (1280, 720)
+Resized to: 640x360
+Pixel reduction: 4.00x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 381.27 ms
+  [10/20] Current avg: 381.25 ms
+  [15/20] Current avg: 381.27 ms
+  [20/20] Current avg: 381.30 ms
+
+📊 Results:
+  Mean: 381.30 ms (2.62 Hz)
+  Std:  0.43 ms
+
+============================================================
+Testing resolution: 480x270
+============================================================
+Original sizes: (1280, 720)
+Resized to: 480x270
+Pixel reduction: 7.11x
+🔥 Warming up...
+⏱️  Profiling 20 runs...
+  [5/20] Current avg: 230.02 ms
+  [10/20] Current avg: 230.01 ms
+  [15/20] Current avg: 229.98 ms
+  [20/20] Current avg: 229.98 ms
+
+📊 Results:
+  Mean: 229.98 ms (4.35 Hz)
+  Std:  0.33 ms
+
+================================================================================
+📊 Resolution Comparison Summary
+================================================================================
+
+Resolution      Time (ms)    Speedup    Hz       Action Expert Reuse 
+--------------------------------------------------------------------------------
+1280x720        1487.3       1.00      x 0.67     14x
+480x270         230.0        6.47      x 4.35     2x
+640x360         381.3        3.90      x 2.62     3x
+960x540         801.4        1.86      x 1.25     8x
+
+💡 Recommendations:
+--------------------------------------------------------------------------------
+Best speedup: 960x540 → 1.86x faster
+
+✅ Recommended: 480x270
+   - VLM time: 230ms
+   - VL feature reuse: 2x
+   - Action Expert: 10 Hz (100ms period)
+
+✅ Results saved to resolution_test_5views.json

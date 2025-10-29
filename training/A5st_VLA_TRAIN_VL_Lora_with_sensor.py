@@ -529,8 +529,10 @@ def main():
                         help="Enable sensor encoder training")
     parser.add_argument("--sensor-input-channels", type=int, default=1026,
                         help="Sensor input channels (1 force + 1025 A-scan)")
-    parser.add_argument("--sensor-temporal-length", type=int, default=650,
-                        help="Sensor temporal length (650Hz * 1s)")
+    parser.add_argument("--sensor-temporal-length", type=int, default=65,
+                        help="Sensor temporal length (65 = 100ms @ 650Hz for async)")
+    parser.add_argument("--sensor-window-size", type=int, default=65,
+                        help="Sensor window size for dataset (default: 65 for 100ms @ 650Hz)")
     parser.add_argument("--sensor-output-dim", type=int, default=3072,
                         help="Sensor encoder output dimension (should match VL dimension)")
     parser.add_argument("--fusion-strategy", choices=["concat", "cross_attention", "gated", "none"],
@@ -539,6 +541,12 @@ def main():
                         help="Learning rate for sensor encoder")
     parser.add_argument("--sensor-loss-weight", type=float, default=2.0,
                         help="Loss weight multiplier for samples with sensor data")
+
+    # 🔥 NEW: Image resize for faster VLM inference
+    parser.add_argument("--image-resize-height", type=int, default=360,
+                        help="Image resize height (default: 360 for 640x360)")
+    parser.add_argument("--image-resize-width", type=int, default=640,
+                        help="Image resize width (default: 640 for 640x360)")
 
     # ✅ NEW: Dataset paths
     parser.add_argument("--batch-size", type=int, default=1,
@@ -560,11 +568,15 @@ def main():
 
     if rank == 0:
         print(f"🚀 [Rank {rank}] Running in {args.mode.upper()} mode on {world_size} GPUs")
-        print(f"🔬 Sensor enabled: {args.sensor_enabled}")
+        print(f"🔬 Stage 1 Optimized Training")
+        print(f"   - Sensor enabled: {args.sensor_enabled}")
         if args.sensor_enabled:
+            print(f"   - Sensor window: {args.sensor_window_size} samples (100ms @ 650Hz)")
             print(f"   - Fusion strategy: {args.fusion_strategy}")
             print(f"   - Sensor LR: {args.sensor_lr}")
             print(f"   - Sensor loss weight: {args.sensor_loss_weight}")
+        print(f"   - Image resize: {args.image_resize_width}x{args.image_resize_height}")
+        print(f"   - Priority datasets: 2x weight (Needle_insertion, White_silicone)")
 
     # ✅ NEW: Build integrated dataset manually
     if rank == 0:
@@ -575,27 +587,47 @@ def main():
 
     datasets = []
 
-    # With sensor data
-    sensor_dataset_dirs = [
+    # Priority datasets (with sensor data) - will be added 2x for weighted sampling
+    priority_dataset_dirs = [
         "/home/najo/NAS/VLA/dataset/White_silicone_white_circle/recv_all_*",
         "/home/najo/NAS/VLA/dataset/Needle_insertion_eye_trocar/recv_all_*",
     ]
 
-    # Without sensor data
-    nosensor_dataset_dirs = [
+    # Regular datasets (without sensor data) - added 1x
+    regular_dataset_dirs = [
         "/home/najo/NAS/VLA/dataset/OCT_insertion/Captures*",
         "/home/najo/NAS/VLA/dataset/part1/ZED_Captures_*th",
     ]
 
-    # Expand wildcards and load datasets
-    all_dirs = sensor_dataset_dirs + nosensor_dataset_dirs
-    for pattern in all_dirs:
+    # Add priority datasets 2x for weighted sampling
+    for pattern in priority_dataset_dirs:
         expanded_paths = glob.glob(pattern)
         for traj_dir in expanded_paths:
             try:
                 ds = insertionMeca500DatasetWithSensor(
                     trajectory_dir=traj_dir,
-                    horizon=8
+                    horizon=8,
+                    sensor_window_size=args.sensor_window_size,
+                )
+                # Add 2x for 2x sampling weight
+                datasets.append(ds)
+                datasets.append(ds)
+                sensor_status = "WITH sensor" if ds.has_sensor else "NO sensor"
+                if rank == 0:
+                    print(f"✅ [Priority 2x] Added: {Path(traj_dir).name} ({len(ds)} samples, {sensor_status})")
+            except Exception as e:
+                if rank == 0:
+                    print(f"⚠️ Failed to load {traj_dir}: {e}")
+
+    # Add regular datasets 1x
+    for pattern in regular_dataset_dirs:
+        expanded_paths = glob.glob(pattern)
+        for traj_dir in expanded_paths:
+            try:
+                ds = insertionMeca500DatasetWithSensor(
+                    trajectory_dir=traj_dir,
+                    horizon=8,
+                    sensor_window_size=args.sensor_window_size,
                 )
                 datasets.append(ds)
                 sensor_status = "WITH sensor" if ds.has_sensor else "NO sensor"
@@ -625,8 +657,18 @@ def main():
     if args.mode == "cache":
         if rank == 0:
             print("⏳ Initializing VL-only model for cache building...")
+            print(f"   Image resize: {args.image_resize_width}x{args.image_resize_height}")
 
         processor = AutoProcessor.from_pretrained(vl_model_name)
+
+        # Configure image resize for cache building
+        if args.image_resize_height is not None and args.image_resize_width is not None:
+            target_pixels = args.image_resize_height * args.image_resize_width
+            processor.image_processor.min_pixels = target_pixels
+            processor.image_processor.max_pixels = target_pixels
+            if rank == 0:
+                print(f"   📐 Cache will use {args.image_resize_width}x{args.image_resize_height} images ({target_pixels:,} pixels)")
+
         vl_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             vl_model_name,
             torch_dtype=torch.bfloat16,
@@ -700,6 +742,10 @@ def main():
             sensor_temporal_length=args.sensor_temporal_length,
             sensor_output_dim=args.sensor_output_dim,
             fusion_strategy=args.fusion_strategy,
+
+            # 🔥 NEW: Image resize for faster VLM inference
+            image_resize_height=args.image_resize_height,
+            image_resize_width=args.image_resize_width,
 
             # 🔥 NEW: Stage 1 checkpoint loading
             stage1_checkpoint=args.stage1_checkpoint,

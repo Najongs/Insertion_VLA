@@ -1,0 +1,54 @@
+/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/transformer.py:306: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+================================================================================
+🔬 Profiling Diffusion Action Expert Inference Speed
+================================================================================
+
+Configuration:
+  VL dim: 3072
+  Sensor dim: 3072
+  Action: 7D × 8 horizon
+  Total timesteps: 100
+  Batch size: 1
+
+Target: < 100ms (for 10Hz action expert)
+================================================================================
+
+🚀 Loading Diffusion Action Expert...
+✅ DiffusionActionExpert initialized:
+   Timesteps: 100, Fusion: concat
+   Action shape: (B, 8, 7)
+✅ Model loaded on cuda
+
+============================================================
+Testing DDIM steps: 5
+============================================================
+🔥 Warming up...
+Traceback (most recent call last):
+  File "/home/najo/NAS/VLA/Insertion_VLA/utils/profile_diffusion_speed.py", line 211, in <module>
+    results = profile_diffusion_inference(
+  File "/home/najo/NAS/VLA/Insertion_VLA/utils/profile_diffusion_speed.py", line 96, in profile_diffusion_inference
+    _ = model.sample(
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/najo/NAS/VLA/Insertion_VLA/models/model_with_sensor_diffusion.py", line 342, in sample
+    return self._ddim_sample(x, vl_tokens, sensor_features, ddim_steps)
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/najo/NAS/VLA/Insertion_VLA/models/model_with_sensor_diffusion.py", line 378, in _ddim_sample
+    eps_pred = self.forward(x, t_batch, vl_tokens, sensor_features)
+  File "/home/najo/NAS/VLA/Insertion_VLA/models/model_with_sensor_diffusion.py", line 260, in forward
+    t_embed = self.time_embed(t_embed)  # (B, hidden_dim)
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/container.py", line 217, in forward
+    input = module(input)
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/najo/.conda/envs/qwen_env/lib/python3.10/site-packages/torch/nn/modules/linear.py", line 116, in forward
+    return F.linear(input, self.weight, self.bias)
+RuntimeError: mat1 and mat2 must have the same dtype, but got Float and BFloat16

@@ -354,8 +354,14 @@ def main():
     parser.add_argument("--sensor-loss-weight", type=float, default=2.0)
 
     # Async
-    parser.add_argument("--vlm-reuse-count", type=int, default=17,
-                        help="How many times to reuse VL features (default: 17 for multi-view 5)")
+    parser.add_argument("--vlm-reuse-count", type=int, default=4,
+                        help="How many times to reuse VL features (default: 4 for 640x360 @ 5 views)")
+
+    # Image resize (for faster VLM inference)
+    parser.add_argument("--image-resize-height", type=int, default=360,
+                        help="Image resize height (default: 360 for 640x360)")
+    parser.add_argument("--image-resize-width", type=int, default=640,
+                        help="Image resize width (default: 640 for 640x360)")
 
     # Data
     parser.add_argument("--batch-size", type=int, default=1)
@@ -373,30 +379,53 @@ def main():
         print(f"🚀 Async VLA Training")
         print(f"   Sensor window: {args.sensor_window_size} samples")
         print(f"   VLM reuse count: {args.vlm_reuse_count}x")
+        print(f"   Image resize: {args.image_resize_width}x{args.image_resize_height}")
 
     # Build dataset
     from vla_datasets.IntegratedDataset import insertionMeca500DatasetWithSensor
     import glob
 
-    datasets = []
-    sensor_dataset_dirs = [
+    # Priority datasets (will be added 2x for weighted sampling)
+    priority_dataset_dirs = [
         "/home/najo/NAS/VLA/dataset/White_silicone_white_circle/recv_all_*",
         "/home/najo/NAS/VLA/dataset/Needle_insertion_eye_trocar/recv_all_*",
     ]
-    nosensor_dataset_dirs = [
+    # Regular datasets (added 1x)
+    regular_dataset_dirs = [
         "/home/najo/NAS/VLA/dataset/OCT_insertion/Captures*",
         "/home/najo/NAS/VLA/dataset/part1/ZED_Captures_*th",
     ]
 
-    all_dirs = sensor_dataset_dirs + nosensor_dataset_dirs
-    for pattern in all_dirs:
+    datasets = []
+
+    # Add priority datasets 2x for weighted sampling
+    for pattern in priority_dataset_dirs:
         expanded_paths = glob.glob(pattern)
         for traj_dir in expanded_paths:
             try:
                 ds = insertionMeca500DatasetWithSensor(
                     trajectory_dir=traj_dir,
                     horizon=8,
-                    sensor_window_size=args.sensor_window_size,  # 🔥 Use async window size
+                    sensor_window_size=args.sensor_window_size,
+                )
+                # Add 2x for 2x sampling weight
+                datasets.append(ds)
+                datasets.append(ds)
+                if rank == 0:
+                    print(f"✅ [Priority 2x] Added: {Path(traj_dir).name} ({len(ds)} samples)")
+            except Exception as e:
+                if rank == 0:
+                    print(f"⚠️ Failed to load {traj_dir}: {e}")
+
+    # Add regular datasets 1x
+    for pattern in regular_dataset_dirs:
+        expanded_paths = glob.glob(pattern)
+        for traj_dir in expanded_paths:
+            try:
+                ds = insertionMeca500DatasetWithSensor(
+                    trajectory_dir=traj_dir,
+                    horizon=8,
+                    sensor_window_size=args.sensor_window_size,
                 )
                 datasets.append(ds)
                 if rank == 0:
@@ -422,6 +451,8 @@ def main():
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        image_resize_height=args.image_resize_height,
+        image_resize_width=args.image_resize_width,
     ).to(device)
 
     # Split dataset

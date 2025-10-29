@@ -255,7 +255,7 @@ class DiffusionActionExpert(nn.Module):
         B, H, A = noisy_actions.shape
 
         # 1. Timestep embedding
-        t_embed = self.timestep_embedding(timesteps)  # (B, 128)
+        t_embed = self.timestep_embedding(timesteps, dtype=noisy_actions.dtype)  # (B, 128)
         t_embed = self.time_embed(t_embed)  # (B, hidden_dim)
         t_embed = t_embed.unsqueeze(1).expand(-1, H, -1)  # (B, H, hidden_dim)
 
@@ -304,17 +304,17 @@ class DiffusionActionExpert(nn.Module):
 
         return cond  # (B, hidden_dim)
 
-    @staticmethod
-    def timestep_embedding(timesteps, dim=128):
+    def timestep_embedding(self, timesteps, dim=128, dtype=torch.float32):
         """
         Sinusoidal timestep embedding (same as Transformer positional encoding)
         """
         half_dim = dim // 2
         emb = np.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
-        emb = timesteps[:, None] * emb[None, :]
+        emb = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb)
+        emb = timesteps[:, None].float() * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-        return emb
+        # Convert to target dtype
+        return emb.to(dtype=dtype)
 
     @torch.no_grad()
     def sample(self, vl_tokens, sensor_features=None, batch_size=1, ddim_steps=None):
@@ -331,10 +331,11 @@ class DiffusionActionExpert(nn.Module):
             actions: (B, H, A) - denoised actions
         """
         device = vl_tokens.device
+        dtype = vl_tokens.dtype
         H, A = self.horizon, self.action_dim
 
-        # Start from pure noise
-        x = torch.randn(batch_size, H, A, device=device)
+        # Start from pure noise with matching dtype
+        x = torch.randn(batch_size, H, A, device=device, dtype=dtype)
 
         # DDIM sampling (faster)
         if ddim_steps is not None:

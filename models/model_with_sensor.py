@@ -615,6 +615,9 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                  fusion_strategy='concat',
                  # Stage 2 checkpoint loading
                  stage1_checkpoint=None,
+                 # Image resize params (for faster inference)
+                 image_resize_height=None,
+                 image_resize_width=None,
                  ):
         super().__init__()
 
@@ -637,6 +640,14 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
 
         # 🔹 VL Model
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
+
+        # 🔹 Configure image resize for faster inference (e.g., 640x360)
+        if image_resize_height is not None and image_resize_width is not None:
+            target_pixels = image_resize_height * image_resize_width
+            self.processor.image_processor.min_pixels = target_pixels
+            self.processor.image_processor.max_pixels = target_pixels
+            print(f"   📐 Image resize: {image_resize_width}x{image_resize_height} ({target_pixels:,} pixels)")
+
         self.vl_model = self._load_qwen_with_fallback(vl_model_name)
 
         # 🔹 Sensor Encoder (Trainable)
