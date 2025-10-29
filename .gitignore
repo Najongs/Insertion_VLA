@@ -9,6 +9,7 @@ dataset/
 .claude/
 wandb/
 checkpoints/
+inference_session*/
 
 # Hugging Face uploads and downloads
 hf_upload_temp/
