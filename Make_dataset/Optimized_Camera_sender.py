@@ -257,98 +257,107 @@ class FastCameraSender(threading.Thread):
             pass  # Queue full, drop frame
 
     def run(self):
-        print("📡 FastCameraSender started")
+            print("📡 FastCameraSender started")
 
-        batch = []
-        last_batch_time = time.time()
+            batch = []
+            last_batch_time = time.time()
 
-        while not stop_flag.is_set():
-            try:
-                # 인코딩된 프레임 가져오기
-                item = self.encode_output_queue.get(timeout=BATCH_TIMEOUT)
-                cam_name, jpg_bytes, timestamp, jpg_size, encode_time = item
-
-                self.stats['encode_times'].append(encode_time)
-
-                # 메타데이터
-                meta = {
-                    'camera': cam_name,
-                    'timestamp': timestamp,
-                    'size': jpg_size,
-                }
-
-                batch.append((meta, jpg_bytes))
-
-                # 배치 전송 조건
-                should_send = (
-                    len(batch) >= BATCH_SEND_SIZE or
-                    (time.time() - last_batch_time) >= BATCH_TIMEOUT
-                )
-
-                if should_send and batch:
-                    t_send_start = time.time()
-
-                    for meta, jpg in batch:
-                        try:
-                            meta_json = json.dumps(meta).encode('utf-8')
-                            self.sock.send_multipart([meta_json, jpg], zmq.DONTWAIT)
-
-                            self.stats['total_sent'] += 1
-                            self.stats['total_bytes'] += len(jpg)
-
-                        except zmq.Again:
-                            pass
-                        except zmq.ZMQError as e:
-                            if e.errno == zmq.ETERM:
-                                return
-                            print(f"[Sender] ZMQ error: {e}")
-                        except Exception as e:
-                            print(f"[Sender] Send error: {e}")
-
-                    send_time = (time.time() - t_send_start) * 1000
-                    self.stats['send_times'].append(send_time)
-
-                    batch = []
-                    last_batch_time = time.time()
-
-            except Empty:
-                # 타임아웃 - 배치가 있으면 전송
-                if batch:
-                    t_send_start = time.time()
-
-                    for meta, jpg in batch:
-                        try:
-                            meta_json = json.dumps(meta).encode('utf-8')
-                            self.sock.send_multipart([meta_json, jpg], zmq.DONTWAIT)
-
-                            self.stats['total_sent'] += 1
-                            self.stats['total_bytes'] += len(jpg)
-
-                        except:
-                            pass
-
-                    send_time = (time.time() - t_send_start) * 1000
-                    self.stats['send_times'].append(send_time)
-
-                    batch = []
-                    last_batch_time = time.time()
-
-            # 통계 출력
-            now = time.time()
-            if now - self.last_stats_print >= self.stats_interval:
-                self._print_stats()
-                self.last_stats_print = now
-
-        # 종료 시 남은 배치 전송
-        if batch:
-            for meta, jpg in batch:
+            while not stop_flag.is_set():
                 try:
-                    meta_json = json.dumps(meta).encode('utf-8')
-                    self.sock.send_multipart([meta_json, jpg])
-                except:
-                    pass
+                    # 인코딩된 프레임 가져오기
+                    item = self.encode_output_queue.get(timeout=BATCH_TIMEOUT)
+                    cam_name, jpg_bytes, timestamp, jpg_size, encode_time = item
 
-        print("🛑 FastCameraSender stopped")
+                    self.stats['encode_times'].append(encode_time)
+
+                    # 메타데이터
+                    meta = {
+                        'camera': cam_name,
+                        'timestamp': timestamp,
+                        'size': jpg_size,
+                    }
+
+                    batch.append((meta, jpg_bytes))
+
+                    # 배치 전송 조건
+                    should_send = (
+                        len(batch) >= BATCH_SEND_SIZE or
+                        (time.time() - last_batch_time) >= BATCH_TIMEOUT
+                    )
+
+                    if should_send and batch:
+                        t_send_start = time.time()
+
+                        for meta, jpg in batch:
+                            try:
+                                meta_json = json.dumps(meta).encode('utf-8')
+                                self.sock.send_multipart([meta_json, jpg], zmq.DONTWAIT)
+
+                                self.stats['total_sent'] += 1
+                                self.stats['total_bytes'] += len(jpg)
+
+                            except zmq.Again:
+                                pass # 버퍼가 꽉 찼으면 그냥 무시
+                            except zmq.ZMQError as e:
+                                if e.errno == zmq.ETERM:
+                                    return # 컨텍스트 종료
+                                print(f"[Sender] ZMQ error: {e}")
+                            except Exception as e:
+                                print(f"[Sender] Send error: {e}")
+
+                        send_time = (time.time() - t_send_start) * 1000
+                        self.stats['send_times'].append(send_time)
+
+                        batch = []
+                        last_batch_time = time.time()
+
+                except Empty:
+                    # 타임아웃 - 배치가 있으면 전송
+                    if batch:
+                        t_send_start = time.time()
+                        
+                        for meta, jpg in batch:
+                            try:
+                                meta_json = json.dumps(meta).encode('utf-8')
+                                self.sock.send_multipart([meta_json, jpg], zmq.DONTWAIT)
+
+                                self.stats['total_sent'] += 1
+                                self.stats['total_bytes'] += len(jpg)
+
+                            except:
+                                pass # 오류 발생 시 무시
+
+                        send_time = (time.time() - t_send_start) * 1000
+                        self.stats['send_times'].append(send_time)
+
+                        batch = []
+                        last_batch_time = time.time()
+
+                # 통계 출력
+                now = time.time()
+                if now - self.last_stats_print >= self.stats_interval:
+                    self._print_stats()
+                    self.last_stats_print = now
+
+            # --- 📍 수정된 부분 시작 ---
+            
+            # 1. (사용자 요청) 남은 배치 버리기
+            if batch:
+                print(f"📡 Sender.run() loop stopped. Discarding {len(batch)} items from final batch.")
+
+            # 2. (데드락 방지) 인코더 프로세스가 멈추지 않도록 출력 큐를 비웁니다.
+            print(f"📡 Draining output queue to unblock encoders...")
+            try:
+                # 큐가 빌 때까지 모든 아이템을 강제로 꺼내서 버립니다.
+                while True:
+                    self.encode_output_queue.get(timeout=0.01)
+            except Empty:
+                print("📡 Output queue drained.")
+            except Exception as e:
+                print(f"[Sender Drain] Error draining queue: {e}")
+
+            print("🛑 FastCameraSender.run() thread finished")
+            # --- 📍 수정된 부분 끝 ---
 
     def _print_stats(self):
         """통계 출력"""
@@ -369,16 +378,51 @@ class FastCameraSender(threading.Thread):
         self.stats['total_bytes'] = 0
 
     def stop(self):
-        """종료"""
-        print("⏳ Stopping encoders...")
-        for _ in range(NUM_ENCODER_PROCESSES):
-            self.encode_input_queue.put(None)
+            """종료"""
+            print("⏳ Stopping encoders...")
+            try:
+                for _ in range(NUM_ENCODER_PROCESSES):
+                    self.encode_input_queue.put(None)
+            except Exception as e:
+                print(f"[Sender Stop] Error putting None on queue: {e}")
 
-        for p in self.encoders:
-            p.join(timeout=2.0)
+            # --- BEGIN FIX (안전한 큐 종료) ---
+            had_to_terminate = False
+            for p in self.encoders:
+                p.join(timeout=2.0) # run() 수정으로 이제 2초 안에 정상 종료되어야 합니다.
+                if p.is_alive():
+                    print(f"⚠️ Encoder {p.pid} did not terminate, killing...")
+                    p.terminate()
+                    p.join() # terminate()가 완료될 때까지 대기
+                    had_to_terminate = True
+            
+            print("⏳ Closing queues...")
+            try:
+                self.encode_input_queue.close()
+                self.encode_output_queue.close()
 
-        self.sock.close()
-        print("✅ FastCameraSender stopped")
+                if had_to_terminate:
+                    print("⚠️ Terminated processes; force-cancelling queue threads.")
+                    # '깨진' 큐에 대해 join_thread()를 호출하면 행이 걸리므로
+                    # 대신 cancel_join_thread()를 호출합니다.
+                    self.encode_input_queue.cancel_join_thread()
+                    self.encode_output_queue.cancel_join_thread()
+                else:
+                    print("✅ Encoders joined gracefully; joining queue threads.")
+                    # 정상 종료된 경우에만 안전하게 join_thread() 호출
+                    self.encode_input_queue.join_thread()
+                    self.encode_output_queue.join_thread()
+            except Exception as e:
+                print(f"[Sender Stop] Error closing queues: {e}")
+            # --- END FIX ---
+
+            print("⏳ Closing ZMQ socket...")
+            self.sock.close(linger=0) 
+            
+            print("⏳ Terminating ZMQ context...")
+            self.ctx.term()
+
+            print("✅ FastCameraSender stopped")
 
 
 # ===================== ZED 카메라 캡처 =====================
@@ -389,7 +433,7 @@ def zed_camera_process(serial, trigger_event, sender, stop_event):
 
     zed = sl.Camera()
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720
+    init_params.camera_resolution = sl.RESOLUTION.HD1080
     init_params.camera_fps = 30
     init_params.set_from_serial_number(int(serial))
     init_params.depth_mode = sl.DEPTH_MODE.NONE
@@ -537,28 +581,36 @@ def main():
     print(f"Capturing at {args.fps} Hz")
     print(f"Press Ctrl+C to stop\n")
 
-    # 대기
+    # 대기 (수정된 부분)
     try:
-        while True:
-            time.sleep(1)
+        stop_flag.wait()
+        print("\n🛑 Main thread received stop signal, initiating cleanup...")
+
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
+        # signal 핸들러가 주 로직이지만, 만약을 대비한 fallback
+        print("\n🛑 Shutting down (from KB Interrupt)...")
+        stop_flag.set()
+        encoder_stop_flag.set()
 
     # 종료
+    print("⏳ Shutting down threads and processes...")
+    
+    # 플래그가 이미 핸들러에서 설정되었지만, 여기서 한 번 더 보장합니다.
     stop_flag.set()
     encoder_stop_flag.set()
 
     # 스레드 종료 대기
     for t in camera_threads:
         t.join(timeout=2.0)
-
+    
+    print("⏳ Stopping trigger...")
     trigger.join(timeout=1.0)
 
+    # Sender와 인코더 종료
     sender.stop()
     sender.join(timeout=2.0)
 
     print("\n✅ Camera Sender stopped successfully")
-
 
 if __name__ == "__main__":
     main()
