@@ -326,35 +326,27 @@ def Train_Diffusion(
             })
 
             # Save checkpoint
+            # === Save epoch checkpoint ===
             ckpt_path = CKPT_DIR / f"diffusion_epoch{epoch+1}.pt"
+            writer.submit(state, ckpt_path)
+            print(f"   Checkpoint saved: {ckpt_path}")
 
-            # Determine what to save based on training stage
+            # === Save recent checkpoint (overwrite every epoch) ===
+            recent_ckpt = CKPT_DIR / "qwen_vla_sensor_recent.pt"
+            torch.save(state, recent_ckpt)
+            print(f"💾 [Recent] Latest checkpoint updated: {recent_ckpt}")
+
+            # Save Sensor Encoder + Action Expert
             model_module = model.module if hasattr(model, "module") else model
-            training_stage = getattr(Train_Diffusion, '_training_stage', 'stage1')
-
-            if training_stage == 'stage1':
-                # Stage 1: Save only Sensor Encoder + Action Expert
-                state = {
-                    "epoch": epoch + 1,
-                    "sensor_encoder": model_module.sensor_encoder.state_dict() if model_module.sensor_enabled else None,
-                    "action_expert": model_module.action_expert.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                    "loss": avg_loss,
-                    "training_stage": "stage1",
-                }
-                print(f"💾 [Stage 1] Saving Sensor + Action Expert only")
-            else:
-                # Stage 2: Save full model state
-                state = {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model_module.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                    "loss": avg_loss,
-                    "training_stage": "stage2",
-                }
-                print(f"💾 [Stage 2] Saving full model state")
+            state = {
+                "epoch": epoch + 1,
+                "sensor_encoder": model_module.sensor_encoder.state_dict() if model_module.sensor_enabled else None,
+                "action_expert": model_module.action_expert.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                "loss": avg_loss,
+            }
+            print(f"💾 Saving Sensor + Action Expert")
 
             writer.submit(state, ckpt_path)
             print(f"   Checkpoint saved: {ckpt_path}")
@@ -432,142 +424,216 @@ def main():
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--val_split', type=float, default=0.1, help='Validation split ratio')
 
-    # 2-Stage Training Arguments
-    parser.add_argument('--training-stage', type=str, choices=['stage1', 'stage2'], default='stage1',
-                        help='Training stage: stage1 (Sensor+Action only, VL frozen) or stage2 (Full model with LoRA)')
-    parser.add_argument('--stage1-checkpoint', type=str, default=None,
-                        help='Path to Stage 1 checkpoint (required for stage2)')
-
-    # LoRA Arguments (for Stage 2)
-    parser.add_argument('--finetune-vl', choices=['none', 'lora', 'full'], default='lora',
-                        help='VL fine-tuning mode for Stage 2')
-    parser.add_argument('--lora-r', type=int, default=16, help='LoRA rank')
-    parser.add_argument('--lora-alpha', type=int, default=32, help='LoRA alpha')
-    parser.add_argument('--lora-dropout', type=float, default=0.05, help='LoRA dropout')
-    parser.add_argument('--vl-lr', type=float, default=1e-5, help='Learning rate for VL (Stage 2)')
-
     args = parser.parse_args()
 
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
 
-    # Validate Stage 2 requirements
-    if args.training_stage == 'stage2' and not args.stage1_checkpoint:
-        raise ValueError("❌ Stage 2 training requires --stage1-checkpoint")
-
     if rank == 0:
         print(f"🚀 Training Diffusion VLA with Sensor Integration")
-        print(f"   Training Stage: {args.training_stage.upper()}")
         print(f"   World Size: {world_size}")
         print(f"   Diffusion Timesteps: {args.diffusion_timesteps}")
         print(f"   Dataset: {args.dataset_dir}")
-        if args.training_stage == 'stage2':
-            print(f"   Stage 1 Checkpoint: {args.stage1_checkpoint}")
-            print(f"   VL Fine-tuning: {args.finetune_vl}")
 
     # Note: VL cache will be built on-the-fly during training
     # For faster training, you can pre-build cache using Make_VL_cache.py
 
-    # Load model based on training stage
-    if args.training_stage == 'stage1':
-        # Stage 1: Frozen VL, train Sensor + Action Expert only
-        if rank == 0:
-            print("📍 Stage 1: Training Sensor Encoder + Diffusion Action Expert (VL frozen)")
-        model = QwenVLAWithSensorDiffusion(
-            vl_model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-            action_dim=7,
-            horizon=8,
-            hidden_dim=1024,
-            sensor_enabled=True,
-            fusion_strategy='concat',
-            diffusion_timesteps=args.diffusion_timesteps,
-        ).to(device)
+    # Load model - Frozen VL, train Sensor + Action Expert only
+    if rank == 0:
+        print("📍 Training Sensor Encoder + Diffusion Action Expert (VL frozen)")
+    model = QwenVLAWithSensorDiffusion(
+        vl_model_name="Qwen/Qwen2.5-VL-3B-Instruct",
+        action_dim=7,
+        horizon=8,
+        hidden_dim=1024,
+        sensor_enabled=True,
+        fusion_strategy='concat',
+        diffusion_timesteps=args.diffusion_timesteps,
+    ).to(device)
 
-    else:  # stage2
-        # Stage 2: Load Stage 1 checkpoint, add LoRA, train entire model
-        if rank == 0:
-            print("📍 Stage 2: Training Full Model with LoRA")
-        model = Not_freeze_QwenVLAWithSensorDiffusion(
-            vl_model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-            action_dim=7,
-            horizon=8,
-            hidden_dim=1024,
-            sensor_enabled=True,
-            fusion_strategy='concat',
-            diffusion_timesteps=args.diffusion_timesteps,
-            finetune_vl=args.finetune_vl,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            stage1_checkpoint=args.stage1_checkpoint,
-        )
-
-        # Move entire model to device (including VL model with LoRA)
-        model = model.to(device)
-
-        # Explicitly move VL model to ensure PEFT wrapped model is on correct device
-        if hasattr(model, 'vl_model'):
-            model.vl_model = model.vl_model.to(device)
-
-        if rank == 0:
-            print(f"✅ Model moved to device: {device}")
-
-    # DDP with find_unused_parameters for Stage 2 (when using cache with LoRA)
-    find_unused = (args.training_stage == 'stage2' and args.finetune_vl != 'none')
+    # DDP
     model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                find_unused_parameters=find_unused,
-                gradient_as_bucket_view=False)  # Required for gradient checkpointing
+                find_unused_parameters=False,
+                gradient_as_bucket_view=False)
 
-    # Set static graph for gradient checkpointing compatibility
-    if args.training_stage == 'stage2':
-        model._set_static_graph()
+    # Build dataset with weighted sampling
+    from vla_datasets.AsyncIntegratedDataset import AsyncInsertionMeca500DatasetWithSensor
+    from vla_datasets.NewAsyncDataset import NewAsyncInsertionDataset
+    from torch.utils.data import WeightedRandomSampler, Subset
+    import glob
 
-    # Create dataloader
-    train_loader, val_loader = create_integrated_dataloader(
-        dataset_root=Path(args.dataset_dir),
-        batch_size=args.batch_size,
-        num_workers=4,
-        shuffle=True,
-        val_split=args.val_split,
-        distributed=True,
-        rank=rank,
-        world_size=world_size,
+    # Old datasets (priority: 2x, regular: 1x)
+    priority_old_dataset_dirs = [
+        "/home/najo/NAS/VLA/dataset/White_silicone_white_circle/recv_all_*",
+        "/home/najo/NAS/VLA/dataset/Needle_insertion_eye_trocar/recv_all_*",
+    ]
+    # OCT_insertion과 part1은 아직 전처리 안 됨 - 나중에 추가
+    regular_old_dataset_dirs = [
+        # "/home/najo/NAS/VLA/dataset/OCT_insertion/Captures*",
+        # "/home/najo/NAS/VLA/dataset/part1/ZED_Captures_*th",
+    ]
+
+    # New dataset path (3x weight)
+    new_dataset_path = "Make_dataset/New_dataset"
+
+    datasets = []
+    dataset_weights = []
+
+    # Load priority old datasets (2x weight)
+    if rank == 0:
+        print("\n📦 Loading priority old datasets (2x weight)...")
+    for pattern in priority_old_dataset_dirs:
+        expanded_paths = glob.glob(pattern)
+        for traj_dir in expanded_paths:
+            try:
+                ds = AsyncInsertionMeca500DatasetWithSensor(
+                    trajectory_dir=traj_dir,
+                    horizon=8,
+                    vlm_reuse_count=1,  # Diffusion doesn't use VLM reuse
+                    sensor_window_size=650,  # Diffusion uses 650
+                )
+                datasets.append(ds)
+                dataset_weights.extend([2.0] * len(ds))
+                if rank == 0:
+                    print(f"✅ [2x] {Path(traj_dir).name}: {len(ds)} samples")
+            except Exception as e:
+                if rank == 0:
+                    print(f"⚠️ Failed to load {traj_dir}: {e}")
+
+    # Load regular old datasets (1x weight)
+    if rank == 0:
+        print("\n📦 Loading regular old datasets (1x weight)...")
+    for pattern in regular_old_dataset_dirs:
+        expanded_paths = glob.glob(pattern)
+        for traj_dir in expanded_paths:
+            try:
+                ds = AsyncInsertionMeca500DatasetWithSensor(
+                    trajectory_dir=traj_dir,
+                    horizon=8,
+                    vlm_reuse_count=1,  # Diffusion doesn't use VLM reuse
+                    sensor_window_size=650,
+                )
+                datasets.append(ds)
+                dataset_weights.extend([1.0] * len(ds))
+                if rank == 0:
+                    print(f"✅ [1x] {Path(traj_dir).name}: {len(ds)} samples")
+            except Exception as e:
+                if rank == 0:
+                    print(f"⚠️ Failed to load {traj_dir}: {e}")
+
+    # Load new datasets (3x weight)
+    if rank == 0:
+        print("\n📦 Loading new datasets (3x weight)...")
+    new_dataset_path = Path(new_dataset_path)
+    if new_dataset_path.exists():
+        for task_dir in new_dataset_path.iterdir():
+            if not task_dir.is_dir():
+                continue
+
+            task_name = task_dir.name.replace('_', ' ')
+            instruction = f"Perform {task_name} insertion task"
+
+            for episode_dir in task_dir.iterdir():
+                if not episode_dir.is_dir() or not episode_dir.name.startswith('episode_'):
+                    continue
+
+                try:
+                    ds = NewAsyncInsertionDataset(
+                        episode_dir=episode_dir,
+                        horizon=8,
+                        vlm_reuse_count=1,  # Diffusion doesn't use VLM reuse
+                        action_expert_hz=10,
+                        instruction=instruction,
+                    )
+                    datasets.append(ds)
+                    dataset_weights.extend([3.0] * len(ds))
+                    if rank == 0:
+                        print(f"✅ [3x] {task_dir.name}/{episode_dir.name}: {len(ds)} samples")
+                except Exception as e:
+                    if rank == 0:
+                        print(f"⚠️ Failed to load {episode_dir}: {e}")
+    else:
+        if rank == 0:
+            print(f"⚠️ New dataset path not found: {new_dataset_path}")
+
+    if not datasets:
+        raise ValueError("No datasets loaded!")
+
+    full_dataset = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+
+    if rank == 0:
+        print(f"\n📊 Total dataset statistics:")
+        print(f"   Total samples: {len(full_dataset)}")
+        print(f"   Old priority (2x): {sum(1 for w in dataset_weights if w == 2.0)}")
+        print(f"   Old regular (1x): {sum(1 for w in dataset_weights if w == 1.0)}")
+        print(f"   New datasets (3x): {sum(1 for w in dataset_weights if w == 3.0)}")
+
+    # Split dataset and weights
+    total_len = len(full_dataset)
+    val_len = int(total_len * args.val_split)
+    train_len = total_len - val_len
+
+    # Create indices for split
+    indices = list(range(total_len))
+    random.shuffle(indices)
+    train_indices = indices[:train_len]
+    val_indices = indices[train_len:]
+
+    # Split datasets and weights
+    train_ds = Subset(full_dataset, train_indices)
+    val_ds = Subset(full_dataset, val_indices)
+
+    # Split weights for training set
+    train_weights = [dataset_weights[i] for i in train_indices]
+
+    # Create weighted sampler for training
+    sampler_weights = torch.tensor(train_weights, dtype=torch.float32)
+
+    # For DDP: each rank gets a portion of the dataset
+    samples_per_rank = len(train_ds) // world_size
+    if rank == world_size - 1:
+        samples_per_rank += len(train_ds) % world_size  # Last rank gets remainder
+
+    train_sampler = WeightedRandomSampler(
+        weights=sampler_weights,
+        num_samples=samples_per_rank,
+        replacement=True,
     )
 
-    # Optimizer - Different learning rates for VL and other components in Stage 2
-    if args.training_stage == 'stage2' and args.finetune_vl != 'none':
-        # Separate parameter groups for VL (LoRA) and others
-        vl_params = []
-        other_params = []
+    val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
 
-        model_module = model.module if hasattr(model, 'module') else model
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        num_workers=4,
+        sampler=train_sampler,
+        collate_fn=collate_fn_with_sensor,
+        prefetch_factor=4 if 4 > 0 else None,
+        persistent_workers=False,
+        pin_memory=False
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        num_workers=4,
+        sampler=val_sampler,
+        collate_fn=collate_fn_with_sensor,
+        persistent_workers=False,
+        pin_memory=False,
+    )
 
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                # LoRA parameters or VL model parameters
-                if 'vl_model' in name or 'lora' in name.lower():
-                    vl_params.append(param)
-                else:
-                    other_params.append(param)
+    if rank == 0:
+        print(f"   Train loader: {len(train_loader)} batches")
+        print(f"   Val loader: {len(val_loader)} batches")
 
-        if rank == 0:
-            print(f"🎯 Optimizer config:")
-            print(f"   VL params: {len(vl_params)} (lr={args.vl_lr})")
-            print(f"   Other params: {len(other_params)} (lr={args.lr})")
-
-        optimizer = torch.optim.AdamW([
-            {'params': vl_params, 'lr': args.vl_lr, 'weight_decay': 0.01},
-            {'params': other_params, 'lr': args.lr, 'weight_decay': 0.01},
-        ], betas=(0.9, 0.95))
-    else:
-        # Stage 1: Single learning rate
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=args.lr,
-            weight_decay=0.01,
-            betas=(0.9, 0.95),
-        )
+    # Optimizer - Single learning rate for Sensor + Action Expert
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        weight_decay=0.01,
+        betas=(0.9, 0.95),
+    )
 
     # Scheduler
     total_steps = len(train_loader) * args.epochs // args.grad_accum
@@ -591,9 +657,6 @@ def main():
         if scheduler and ckpt["scheduler_state_dict"]:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt.get("epoch", 0)
-
-    # Store training stage for checkpoint saving
-    Train_Diffusion._training_stage = args.training_stage
 
     # Train
     Train_Diffusion(

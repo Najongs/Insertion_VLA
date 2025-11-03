@@ -27,10 +27,10 @@ def build_vl_cache_distributed_optimized(
     dataset,
     device="cuda",
     *,
-    batch_size=512,          # DataLoader 배치 (VRAM 24GB면 2~4 권장)
+    batch_size=16,          # DataLoader 배치 (VRAM 24GB면 2~4 권장)
     num_workers=8,
     prefetch_factor=4,
-    micro_bs=2,            # 마이크로 배치 (OOM 시 자동 백오프)
+    micro_bs=1,            # 마이크로 배치 (OOM 시 자동 백오프)
     key_mode="full",       # "traj": traj_path 단위 캐시 / "full": (traj+lang+views) 단위
     rank_sharded_cache=False,  # rank별 캐시 폴더 분리
     cache_dir_fallback="/home/najo/NAS/VLA/dataset/cache/qwen_vl_features",
@@ -128,9 +128,9 @@ def build_vl_cache_distributed_optimized(
         num_workers=num_workers,
         sampler=sampler,
         collate_fn=collate_fn,
-        prefetch_factor=prefetch_factor,
-        pin_memory=True,
-        persistent_workers=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        pin_memory=False,
+        persistent_workers=False,
     )
 
     total_local = math.ceil(len(dataset) / world_size)

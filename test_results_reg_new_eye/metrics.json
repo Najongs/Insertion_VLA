@@ -1,0 +1,48 @@
+{
+  "overall_mse": 0.0005675613647326827,
+  "overall_mae": 0.01583281345665455,
+  "first_action_mse": 0.0005704458453692496,
+  "full_horizon_mse": 0.0005675613647326827,
+  "mse_per_dim": [
+    0.0032438880298286676,
+    0.00015158834867179394,
+    9.919980220729485e-05,
+    5.4710570111637935e-05,
+    5.576071635005064e-05,
+    0.00025410988018848,
+    0.00011366699618520215
+  ],
+  "mae_per_dim": [
+    0.056664999574422836,
+    0.010324607603251934,
+    0.008578315377235413,
+    0.006050623953342438,
+    0.006697824690490961,
+    0.013630957342684269,
+    0.0088823726400733
+  ],
+  "correlations": [
+    0.9998916558342569,
+    0.9982659042141002,
+    0.9968155839021279,
+    0.9999999568648665,
+    0.9971009200381397,
+    0.9999999054211411,
+    0.0
+  ],
+  "action_names": [
+    "dx",
+    "dy",
+    "dz",
+    "da",
+    "db",
+    "dr",
+    "gripper"
+  ],
+  "interpretation": {
+    "mse": "Lower is better - measures absolute error magnitude",
+    "mae": "Lower is better - measures average absolute error",
+    "correlation": "Higher is better (0~1) - measures trend similarity. >0.8 is good, >0.5 is fair",
+    "note": "High correlation with high MSE means the model captures the trend but has scale/offset issues"
+  }
+}

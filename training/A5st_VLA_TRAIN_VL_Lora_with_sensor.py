@@ -49,7 +49,7 @@ torch.cuda.manual_seed_all(seed)
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-torch.use_deterministic_algorithms(True, warn_only=True)
+torch.use_deterministic_algorithms(False, warn_only=True)
 torch.set_float32_matmul_precision("high")
 
 # ✅ NEW: Import sensor-enabled model and dataset
@@ -449,34 +449,18 @@ def Train(
             if not hasattr(Train, "_best_loss"):
                 Train._best_loss = float("inf")
 
-            # Determine what to save based on training stage
+            # Save Sensor Encoder + Action Expert
             model_module = model.module if hasattr(model, "module") else model
-            training_stage = getattr(Train, '_training_stage', 'stage2')
-
-            if training_stage == 'stage1':
-                # Stage 1: Save only Sensor Encoder + Action Expert
-                sensor_enabled = getattr(Train, '_sensor_enabled', True)
-                ckpt_data = {
-                    "epoch": epoch,
-                    "sensor_encoder": model_module.sensor_encoder.state_dict() if sensor_enabled else None,
-                    "action_expert": model_module.action_expert.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                    "val_loss": val_loss,
-                    "training_stage": "stage1",
-                }
-                stage_label = "[Stage 1]"
-            else:
-                # Stage 2: Save full model state
-                ckpt_data = {
-                    "epoch": epoch,
-                    "model_state_dict": model_module.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                    "val_loss": val_loss,
-                    "training_stage": "stage2",
-                }
-                stage_label = "[Stage 2]"
+            sensor_enabled = args.sensor_enabled
+            ckpt_data = {
+                "epoch": epoch,
+                "sensor_encoder": model_module.sensor_encoder.state_dict() if sensor_enabled else None,
+                "action_expert": model_module.action_expert.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                "val_loss": val_loss,
+            }
+            stage_label = ""
 
             is_best = val_loss is not None and val_loss < Train._best_loss
 
@@ -511,18 +495,7 @@ def main():
     parser.add_argument("--grad-accum-steps", type=int, default=8)
     parser.add_argument("--sched-on", choices=["step", "epoch"], default="step")
 
-    # ===== LoRA / Fine-tuning 옵션 =====
-    parser.add_argument("--finetune-vl", choices=["none", "lora", "full"], default="lora",
-                        help="Qwen-VL fine-tuning mode")
-    parser.add_argument("--vl-lr", type=float, default=1e-5,
-                        help="learning rate for VL backbone (LoRA/full mode)")
-    parser.add_argument("--vision-lr", type=float, default=5e-6,
-                        help="learning rate for vision encoder if full fine-tuning")
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--unfreeze-last-n", type=int, default=2,
-                        help="number of transformer blocks to unfreeze when full fine-tuning")
+    # Note: LoRA fine-tuning options removed - this script trains without VL fine-tuning
 
     # ✅ NEW: Sensor-related options
     parser.add_argument("--sensor-enabled", action="store_true",
@@ -554,12 +527,6 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4,
                         help="Number of dataloader workers")
 
-    # 🔥 NEW: 2-Stage Training Arguments
-    parser.add_argument('--training-stage', type=str, choices=['stage1', 'stage2'], default='stage2',
-                        help='Training stage: stage1 (Sensor+Action only, VL frozen) or stage2 (Full model with LoRA)')
-    parser.add_argument('--stage1-checkpoint', type=str, default=None,
-                        help='Path to Stage 1 checkpoint (required for stage2 with finetune-vl != none)')
-
     args = parser.parse_args()
 
     rank, world_size, local_rank = setup_distributed()
@@ -568,21 +535,21 @@ def main():
 
     if rank == 0:
         print(f"🚀 [Rank {rank}] Running in {args.mode.upper()} mode on {world_size} GPUs")
-        print(f"🔬 Stage 1 Optimized Training")
+        print(f"🔬 Training (VL Frozen, Sensor + Action Expert)")
         print(f"   - Sensor enabled: {args.sensor_enabled}")
         if args.sensor_enabled:
-            print(f"   - Sensor window: {args.sensor_window_size} samples (100ms @ 650Hz)")
+            print(f"   - Sensor window: {args.sensor_window_size} samples")
             print(f"   - Fusion strategy: {args.fusion_strategy}")
             print(f"   - Sensor LR: {args.sensor_lr}")
             print(f"   - Sensor loss weight: {args.sensor_loss_weight}")
         print(f"   - Image resize: {args.image_resize_width}x{args.image_resize_height}")
-        print(f"   - Priority datasets: 2x weight (Needle_insertion, White_silicone)")
 
     # ✅ NEW: Build integrated dataset manually
     if rank == 0:
         print("📦 Building integrated dataset...")
 
-    from vla_datasets.IntegratedDataset import insertionMeca500DatasetWithSensor
+    from vla_datasets.AsyncIntegratedDataset import AsyncInsertionMeca500DatasetWithSensor
+    from vla_datasets.NewAsyncDataset import NewAsyncInsertionDataset
     import glob
 
     datasets = []
@@ -599,19 +566,17 @@ def main():
         "/home/najo/NAS/VLA/dataset/part1/ZED_Captures_*th",
     ]
 
-    # Add priority datasets 2x for weighted sampling
+    # 1️⃣ Priority datasets
     for pattern in priority_dataset_dirs:
         expanded_paths = glob.glob(pattern)
         for traj_dir in expanded_paths:
             try:
-                ds = insertionMeca500DatasetWithSensor(
+                ds = AsyncInsertionMeca500DatasetWithSensor(
                     trajectory_dir=traj_dir,
                     horizon=8,
                     sensor_window_size=args.sensor_window_size,
                 )
-                # Add 2x for 2x sampling weight
-                datasets.append(ds)
-                datasets.append(ds)
+                datasets.extend([ds, ds])  # double for weighted sampling
                 sensor_status = "WITH sensor" if ds.has_sensor else "NO sensor"
                 if rank == 0:
                     print(f"✅ [Priority 2x] Added: {Path(traj_dir).name} ({len(ds)} samples, {sensor_status})")
@@ -619,12 +584,12 @@ def main():
                 if rank == 0:
                     print(f"⚠️ Failed to load {traj_dir}: {e}")
 
-    # Add regular datasets 1x
+    # 2️⃣ Regular datasets
     for pattern in regular_dataset_dirs:
         expanded_paths = glob.glob(pattern)
         for traj_dir in expanded_paths:
             try:
-                ds = insertionMeca500DatasetWithSensor(
+                ds = AsyncInsertionMeca500DatasetWithSensor(
                     trajectory_dir=traj_dir,
                     horizon=8,
                     sensor_window_size=args.sensor_window_size,
@@ -637,20 +602,35 @@ def main():
                 if rank == 0:
                     print(f"⚠️ Failed to load {traj_dir}: {e}")
 
+    # 3️⃣ Always add NewAsyncDataset (for both train/cache modes)
+    new_dataset_root = Path("/home/najo/NAS/VLA/Insertion_VLA/Make_dataset/New_dataset")
+
+    if new_dataset_root.exists():
+        print(f"📂 Searching for new datasets under: {new_dataset_root}")
+        for task_dir in new_dataset_root.iterdir():
+            if not task_dir.is_dir():
+                continue
+            for episode_dir in task_dir.iterdir():
+                if episode_dir.is_dir() and episode_dir.name.startswith("episode_"):
+                    try:
+                        ds = NewAsyncInsertionDataset(episode_dir=episode_dir)
+                        print(f"✅ Added new async dataset: {task_dir.name}/{episode_dir.name} ({len(ds)} samples)")
+                        datasets.append(ds)
+                    except Exception as e:
+                        print(f"⚠️ Failed to load {episode_dir}: {e}")
+    else:
+        print(f"⚠️ New dataset root not found: {new_dataset_root}")
+
     if not datasets:
         raise ValueError("No datasets loaded!")
 
-    # Concatenate all datasets
-    if len(datasets) == 1:
-        full_dataset = datasets[0]
-    else:
-        full_dataset = ConcatDataset(datasets)
+    # Merge all datasets
+    full_dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
     if rank == 0:
         print(f"\n📊 Total dataset size: {len(full_dataset)} samples")
 
     vl_model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
-
     # ===========================================================
     # 3️⃣ 캐시 생성 모드
     # ===========================================================
@@ -714,41 +694,26 @@ def main():
     # ===========================================================
     if args.mode == "train":
         if rank == 0:
-            print("⏳ Initializing full QwenVLA model for training...")
+            print("⏳ Initializing QwenVLA model for training (VL frozen)...")
 
-        # ✅ NEW: Validate Stage 2 requirements
-        if args.training_stage == 'stage2' and args.finetune_vl != 'none' and not args.stage1_checkpoint:
-            print("⚠️  WARNING: Stage 2 training without Stage 1 checkpoint. Training from scratch.")
-
-        if args.training_stage == 'stage1' and args.finetune_vl != 'none':
-            print("⚠️  WARNING: Stage 1 should use finetune-vl=none. Overriding to 'none'.")
-            args.finetune_vl = 'none'
-
-        # ✅ NEW: Initialize sensor-enabled model
+        # ✅ Initialize sensor-enabled model (VL frozen)
         model = Not_freeze_QwenVLAWithSensor(
             vl_model_name=vl_model_name,
             action_dim=7,
             horizon=8,
             hidden_dim=1024,
-            finetune_vl=args.finetune_vl,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            unfreeze_last_n=args.unfreeze_last_n,
+            finetune_vl='none',  # VL frozen
 
-            # ✅ NEW: Sensor configuration
+            # ✅ Sensor configuration
             sensor_enabled=args.sensor_enabled,
             sensor_input_channels=args.sensor_input_channels,
             sensor_temporal_length=args.sensor_temporal_length,
             sensor_output_dim=args.sensor_output_dim,
             fusion_strategy=args.fusion_strategy,
 
-            # 🔥 NEW: Image resize for faster VLM inference
+            # 🔥 Image resize for faster VLM inference
             image_resize_height=args.image_resize_height,
             image_resize_width=args.image_resize_width,
-
-            # 🔥 NEW: Stage 1 checkpoint loading
-            stage1_checkpoint=args.stage1_checkpoint,
         ).to(device)
 
         # 전체 데이터셋 분할
@@ -784,59 +749,34 @@ def main():
 
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-        # === Optimizer 구성 ===
+        # === Optimizer 구성 (Action Expert + Sensor only, VL frozen) ===
         def wd_filter(name, param):
             if param.ndim == 1: return False
             if name.endswith(".bias"): return False
             return True
 
         ae_named = list(model.module.action_expert.named_parameters())
-        vl_named = list(model.module.vl_model.named_parameters())
+        ae_decay = [p for n,p in ae_named if wd_filter(n,p) and p.requires_grad]
+        ae_n_decay = [p for n,p in ae_named if not wd_filter(n,p) and p.requires_grad]
 
-        ae_decay    = [p for n,p in ae_named if wd_filter(n,p) and p.requires_grad]
-        ae_n_decay  = [p for n,p in ae_named if not wd_filter(n,p) and p.requires_grad]
-
-        vl_decay   = [p for n,p in vl_named if wd_filter(n,p) and p.requires_grad]
-        vl_n_decay = [p for n,p in vl_named if not wd_filter(n,p) and p.requires_grad]
-
-        # ✅ NEW: Sensor encoder parameters
+        # ✅ Sensor encoder parameters
         sensor_decay, sensor_n_decay = [], []
         if args.sensor_enabled and hasattr(model.module, 'sensor_encoder'):
             sensor_named = list(model.module.sensor_encoder.named_parameters())
             sensor_decay = [p for n,p in sensor_named if wd_filter(n,p) and p.requires_grad]
             sensor_n_decay = [p for n,p in sensor_named if not wd_filter(n,p) and p.requires_grad]
 
-        vision_decay, vision_n_decay = [], []
-        for n,p in vl_named:
-            if not p.requires_grad:
-                continue
-            if "vision" in n or "visual" in n or "vision_tower" in n:
-                (vision_decay if wd_filter(n,p) else vision_n_decay).append(p)
-
         # === LR 설정 ===
         param_groups = [
-            {"params": ae_decay,        "lr": args.lr,      "weight_decay": 0.01},
-            {"params": ae_n_decay,      "lr": args.lr,      "weight_decay": 0.0},
+            {"params": ae_decay, "lr": args.lr, "weight_decay": 0.01},
+            {"params": ae_n_decay, "lr": args.lr, "weight_decay": 0.0},
         ]
 
-        # ✅ NEW: Add sensor encoder param group
+        # Add sensor encoder param group
         if args.sensor_enabled and (sensor_decay or sensor_n_decay):
             param_groups += [
-                {"params": sensor_decay,    "lr": args.sensor_lr,  "weight_decay": 0.01},
-                {"params": sensor_n_decay,  "lr": args.sensor_lr,  "weight_decay": 0.0},
-            ]
-
-        if args.finetune_vl == "lora":
-            param_groups += [
-                {"params": vl_decay,    "lr": args.vl_lr,   "weight_decay": 0.01},
-                {"params": vl_n_decay,  "lr": args.vl_lr,   "weight_decay": 0.0},
-            ]
-        elif args.finetune_vl == "full":
-            param_groups += [
-                {"params": vision_decay,    "lr": args.vision_lr,  "weight_decay": 0.01},
-                {"params": vision_n_decay,  "lr": args.vision_lr,  "weight_decay": 0.0},
-                {"params": vl_decay,        "lr": args.vl_lr,      "weight_decay": 0.01},
-                {"params": vl_n_decay,      "lr": args.vl_lr,      "weight_decay": 0.0},
+                {"params": sensor_decay, "lr": args.sensor_lr, "weight_decay": 0.01},
+                {"params": sensor_n_decay, "lr": args.sensor_lr, "weight_decay": 0.0},
             ]
 
         optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
@@ -911,10 +851,6 @@ def main():
                 print(f"🆕 [New] 0 → {target_lr:.2e} (warmup/hold/cosine)")
 
         save_path = './checkpoints/qwen_vla_sensor.pt'
-
-        # Store training stage for checkpoint saving
-        Train._training_stage = args.training_stage
-        Train._sensor_enabled = args.sensor_enabled
 
         # =======================================================
         # ✅ Train 호출

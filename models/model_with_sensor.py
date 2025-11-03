@@ -721,13 +721,22 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
             for impl in attn_candidates:
                 try:
                     print(f"🧠 Trying attn_implementation={impl} with dtype={dtype}...")
-                    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                        vl_model_name,
-                        torch_dtype=dtype,
-                        attn_implementation=impl,
-                        device_map=device_map,
-                        low_cpu_mem_usage=True,
-                    )
+                    # For DDP (device_map=None), load on CPU first
+                    if device_map is None:
+                        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                            vl_model_name,
+                            torch_dtype=dtype,
+                            attn_implementation=impl,
+                            low_cpu_mem_usage=True,
+                        )
+                    else:
+                        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                            vl_model_name,
+                            torch_dtype=dtype,
+                            attn_implementation=impl,
+                            device_map=device_map,
+                            low_cpu_mem_usage=True,
+                        )
                     print(f"✅ Successfully loaded with {impl} ({dtype})")
                     self.attn_backend = impl
                     self.model_dtype = dtype
@@ -738,12 +747,19 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
         for dtype in dtype_candidates:
             try:
                 print(f"🧠 Trying default attention with dtype={dtype}...")
-                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    vl_model_name,
-                    torch_dtype=dtype,
-                    device_map=device_map,
-                    low_cpu_mem_usage=True,
-                )
+                if device_map is None:
+                    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        vl_model_name,
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True,
+                    )
+                else:
+                    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        vl_model_name,
+                        torch_dtype=dtype,
+                        device_map=device_map,
+                        low_cpu_mem_usage=True,
+                    )
                 print(f"✅ Successfully loaded with default attention ({dtype})")
                 self.attn_backend = "default"
                 self.model_dtype = dtype
@@ -879,7 +895,7 @@ class Not_freeze_QwenVLAWithSensor(nn.Module):
                     pooled = vl_tokens.mean(dim=1, keepdim=True)
 
                     self._atomic_save(pooled.detach().to("cpu", dtype=torch.float16), path)
-                    self._enforce_cache_limit(max_gb=20)
+                    self._enforce_cache_limit()
                     pooled_vl_tokens_dict[key] = pooled
 
         ordered = [pooled_vl_tokens_dict[k] for k in cache_keys if k in pooled_vl_tokens_dict]

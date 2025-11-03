@@ -549,6 +549,26 @@ class QwenVLAWithSensorDiffusion(BaseQwenVLAWithSensor):
                     ddim_steps=10  # Use DDIM for faster inference
                 )
             return sampled_actions
+        
+    @torch.no_grad()
+    def predict_action(self, 
+                       text_inputs, 
+                       image_inputs, 
+                       sensor_data, 
+                       cache_keys,
+                       **kwargs): # 
+        """
+        Inference-only wrapper for the forward pass.
+        Calls forward() with actions=None to trigger sampling.
+        """
+        self.eval() 
+        return self.forward(
+            text_inputs=text_inputs,
+            image_inputs=image_inputs,
+            actions=None, # 
+            sensor_data=sensor_data,
+            cache_keys=cache_keys
+        )
 
     def _encode_vision_features(self, text_inputs, image_inputs, cache_keys, use_cache, device):
         """Encode VL features with caching - reuse from base class"""
@@ -1052,6 +1072,26 @@ class Not_freeze_QwenVLAWithSensorDiffusion(nn.Module):
             torch.cuda.empty_cache()
 
             return sampled_actions
+        
+    @torch.no_grad()
+    def predict_action(self, 
+                       text_inputs, 
+                       image_inputs, 
+                       sensor_data, 
+                       cache_keys,
+                       **kwargs): # 
+        """
+        Inference-only wrapper for the forward pass.
+        Calls forward() with actions=None to trigger sampling.
+        """
+        self.eval() 
+        return self.forward(
+            text_inputs=text_inputs,
+            image_inputs=image_inputs,
+            actions=None, # 
+            sensor_data=sensor_data,
+            cache_keys=cache_keys
+        )
 
 
 __all__ = [
